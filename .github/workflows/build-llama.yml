@@ -1,0 +1,278 @@
+# Standalone: upload this one file to .github/workflows/ in any GitHub repository.
+# No AIOS checkout, model download, source patch, or automatic release publication.
+name: Build llama-server (Windows CUDA + LLGuidance)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-llama-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  LLAMA_REF: 149f5641b931aaf33697d70f9abc90c3e5300247
+  LLGUIDANCE_REF: d795912fedc7d393de740177ea9ea761e7905774
+  CUDA_VERSION: 13.0.2
+  RUSTUP_TOOLCHAIN: 1.91.1-x86_64-pc-windows-msvc
+  CARGO_BUILD_JOBS: '2'
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Prepare artifact directories
+        run: |
+          New-Item -ItemType Directory -Path logs, dist, package, package/licenses -Force | Out-Null
+
+      - name: Get unmodified official llama.cpp
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ env.LLAMA_REF }}
+          path: llama.cpp
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Prepare CMake, Ninja and Rust
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $toolDir = Join-Path $env:RUNNER_TEMP 'llama-build-tools'
+          python -m venv $toolDir
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot create build-tools environment' }
+          & "$toolDir/Scripts/python.exe" -m pip install --disable-pip-version-check cmake==3.31.10 ninja==1.13.0 2>&1 |
+            Tee-Object -FilePath logs/build-tools.log
+          if ($LASTEXITCODE -ne 0) { throw 'CMake/Ninja installation failed' }
+          "$toolDir/Scripts" >> $env:GITHUB_PATH
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --no-self-update 2>&1 |
+            Tee-Object -FilePath logs/rust-setup.log
+          if ($LASTEXITCODE -ne 0) { throw 'Rust installation failed' }
+          Get-Command go -ErrorAction Stop | Out-Null
+
+      - name: Download and verify CUDA build components
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cudaDir = Join-Path $env:RUNNER_TEMP 'llama-cuda'
+          $downloadDir = Join-Path $env:RUNNER_TEMP 'llama-cuda-downloads'
+          New-Item -ItemType Directory -Path $cudaDir, $downloadDir -Force | Out-Null
+          $baseUrl = 'https://developer.download.nvidia.com/compute/cuda/redist'
+          $manifestPath = Join-Path $PWD 'logs/cuda-redistrib.json'
+          Invoke-WebRequest "$baseUrl/redistrib_$($env:CUDA_VERSION).json" -OutFile $manifestPath
+          $expectedHash = 'fce66717a81c510ffeb89ecc3e79849ab34af3b80139f750876d9033e31d71c2'
+          if ((Get-FileHash $manifestPath -Algorithm SHA256).Hash -ne $expectedHash) {
+            throw 'CUDA manifest checksum mismatch'
+          }
+          $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+          # No GPU driver, profiler, IDE integration, or full CUDA installer needed.
+          $components = 'cuda_cccl', 'cuda_crt', 'cuda_cudart', 'cuda_nvcc', 'libnvvm', 'libcublas'
+          foreach ($name in $components) {
+            $component = $manifest.$name.'windows-x86_64'
+            $zipPath = Join-Path $downloadDir "$name.zip"
+            Write-Host "Downloading $name"
+            Invoke-WebRequest "$baseUrl/$($component.relative_path)" -OutFile $zipPath
+            if ((Get-FileHash $zipPath -Algorithm SHA256).Hash -ne $component.sha256) {
+              throw "CUDA component checksum mismatch: $name"
+            }
+            $extractDir = Join-Path $downloadDir $name
+            Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir
+            $roots = @(Get-ChildItem -LiteralPath $extractDir -Directory)
+            if ($roots.Count -ne 1) { throw "Unexpected CUDA archive layout: $name" }
+            $root = $roots[0].FullName
+            Copy-Item -Path "$root/*" -Destination $cudaDir -Recurse -Force
+            $licenseDir = "package/licenses/cuda-$name"
+            New-Item -ItemType Directory -Path $licenseDir -Force | Out-Null
+            Get-ChildItem -LiteralPath $root -File |
+              Where-Object { $_.Name -match 'LICENSE|EULA|COPYING|NOTICE' } |
+              Copy-Item -Destination $licenseDir
+          }
+          if (-not (Test-Path "$cudaDir/bin/nvcc.exe")) { throw 'nvcc.exe missing' }
+          "CUDA_PATH=$cudaDir" >> $env:GITHUB_ENV
+          "$cudaDir/bin" >> $env:GITHUB_PATH
+
+      - name: Build and package llama-server
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Invoke-Logged([string]$Log, [string]$Command, [string[]]$Arguments) {
+            & $Command @Arguments 2>&1 | Tee-Object -FilePath "logs/$Log"
+            if ($LASTEXITCODE -ne 0) { throw "$Command failed; see $Log" }
+          }
+
+          # Select the VS 2022 toolset supported by this CUDA release.
+          $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          $vsPath = & $vswhere -latest -version '[17.0,18.0)' -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $vsPath) { throw 'VS 2022 C++ tools missing' }
+          Import-Module "$vsPath/Common7/Tools/Microsoft.VisualStudio.DevShell.dll"
+          Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64 -vcvars_ver=14.44'
+          if ($env:VCToolsVersion -notlike '14.44.*') { throw 'MSVC 14.44 toolset is required' }
+          if ((git -C llama.cpp rev-parse HEAD).Trim() -ne $env:LLAMA_REF) { throw 'Source commit mismatch' }
+
+          $configure = @(
+            '-S', 'llama.cpp', '-B', 'build', '-G', 'Ninja Multi-Config',
+            '-DCMAKE_C_COMPILER=cl', '-DCMAKE_CXX_COMPILER=cl',
+            "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH/bin/nvcc.exe",
+            "-DCUDAToolkit_ROOT=$env:CUDA_PATH", '-DCMAKE_CUDA_RUNTIME_LIBRARY=Shared',
+            '-DBUILD_SHARED_LIBS=ON', '-DGGML_BACKEND_DL=OFF', '-DGGML_NATIVE=OFF',
+            '-DGGML_CUDA=ON', '-DGGML_CUDA_CCCL_VERSION=v3.4.3', '-DLLAMA_LLGUIDANCE=ON',
+            '-DLLAMA_BUILD_SERVER=ON', '-DLLAMA_BUILD_TESTS=OFF', '-DLLAMA_BUILD_EXAMPLES=OFF',
+            '-DLLAMA_BUILD_APP=OFF', '-DLLAMA_BUILD_UI=OFF', '-DLLAMA_BUILD_BORINGSSL=ON',
+            '-DBORINGSSL_GIT=https://github.com/google/boringssl.git'
+          )
+          $configure | Set-Content logs/cmake-arguments.txt
+          Invoke-Logged -Log configure.log -Command cmake -Arguments $configure
+          Invoke-Logged -Log build.log -Command cmake -Arguments @('--build', 'build', '--config', 'Release', '--target', 'llama-server', '--parallel', '2')
+
+          $llgSource = 'build/llguidance/source'
+          if ((git -C $llgSource rev-parse HEAD).Trim() -ne $env:LLGUIDANCE_REF) { throw 'LLGuidance commit mismatch' }
+          foreach ($source in @('llama.cpp', $llgSource)) {
+            $changes = git -C $source status --porcelain --untracked-files=no
+            if ($LASTEXITCODE -ne 0 -or $changes) { throw "Tracked source was modified: $source" }
+          }
+          $cache = Get-Content build/CMakeCache.txt -Raw
+          foreach ($flag in @('LLAMA_LLGUIDANCE:BOOL=ON', 'GGML_CUDA:BOOL=ON')) {
+            if (-not $cache.Contains($flag)) { throw "Required build option missing: $flag" }
+          }
+          if (-not (Test-Path "$llgSource/target/release/llguidance.lib")) { throw 'LLGuidance library missing' }
+
+          Copy-Item build/bin/Release/llama-server.exe package/
+          Copy-Item build/bin/Release/*.dll package/
+          foreach ($name in @('cudart64_13.dll', 'cublas64_13.dll', 'cublasLt64_13.dll')) {
+            $runtimeFiles = @(Get-ChildItem -LiteralPath $env:CUDA_PATH -Recurse -File -Filter $name)
+            if ($runtimeFiles.Count -ne 1) { throw "Cannot uniquely locate CUDA runtime: $name" }
+            Copy-Item -LiteralPath $runtimeFiles[0].FullName -Destination package/
+          }
+          foreach ($name in @('Microsoft.VC143.CRT', 'Microsoft.VC143.OpenMP')) {
+            $runtimeDir = Join-Path $env:VCToolsRedistDir "x64/$name"
+            if (-not (Test-Path $runtimeDir)) { throw "MSVC runtime directory missing: $name" }
+            Copy-Item -Path "$runtimeDir/*.dll" -Destination package/
+          }
+
+          # Inspect every shipped PE file, including transitive runtime dependencies.
+          $dependencyReport = @()
+          foreach ($binary in Get-ChildItem package -File | Where-Object { $_.Extension -in '.exe', '.dll' }) {
+            $output = & dumpbin /DEPENDENTS $binary.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Cannot inspect $($binary.Name)" }
+            $dependencyReport += $output
+            foreach ($line in $output) {
+              if ($line -match '^\s+([\w.-]+\.dll)\s*$') {
+                $dll = $Matches[1]
+                # Windows API sets and the NVIDIA driver are supplied by the target OS/driver.
+                if ($dll -match '^(api-ms-|ext-ms-)' -or $dll -ieq 'nvcuda.dll') { continue }
+                if (Test-Path "package/$dll") { continue }
+                if ($dll -notmatch '^(msvcp|vcruntime|vcomp|cudart|cublas|ggml|llama)' -and
+                    (Test-Path "$env:SystemRoot/System32/$dll")) { continue }
+                throw "Missing packaged dependency: $($binary.Name) -> $dll"
+              }
+            }
+          }
+          $dependencyReport | Set-Content logs/dependencies.txt
+
+          Copy-Item llama.cpp/LICENSE package/licenses/llama.cpp.txt
+          Copy-Item "$llgSource/LICENSE" package/licenses/llguidance.txt
+          Copy-Item build/_deps/boringssl-src/LICENSE package/licenses/boringssl.txt
+          Copy-Item build/_deps/cccl-src/LICENSE package/licenses/cccl.txt
+          Copy-Item build/CMakeCache.txt logs/
+          Copy-Item "$llgSource/Cargo.lock" logs/llguidance-Cargo.lock
+
+          $versions = [ordered]@{
+            cmake = (cmake --version) -join "`n"
+            ninja = (ninja --version) -join "`n"
+            rust = (rustc --version) -join "`n"
+            cargo = (cargo --version) -join "`n"
+            go = (go version) -join "`n"
+            nvcc = (nvcc --version) -join "`n"
+            msvc = $env:VCToolsVersion
+            windows_sdk = $env:WindowsSDKVersion
+            runner_image = $env:ImageVersion
+          }
+          $versions | ConvertTo-Json | Set-Content logs/toolchain.json
+          $manifest = [ordered]@{
+            llama_commit = $env:LLAMA_REF
+            llguidance_commit = $env:LLGUIDANCE_REF
+            cuda = $env:CUDA_VERSION
+            patches = @()
+            configure_arguments = $configure
+            toolchain = $versions
+            run_url = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            workflow_commit = $env:GITHUB_SHA
+            gpu_inference = 'not tested; this runner has no NVIDIA GPU'
+            llguidance_inference = 'not tested; no model is downloaded'
+            strict_grammar_failure = 'not guaranteed; unmodified upstream behavior'
+          }
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content package/build-info.json
+          @'
+          Windows x64 llama-server with CUDA 13.0.2 and LLGuidance; no source patches.
+          Keep the EXE and all DLLs in this directory together.
+          Requires a compatible NVIDIA GPU and CUDA 13-capable NVIDIA driver for GPU inference.
+          CUDA 13 does not cover older pre-Turing GPUs. See build-info.json for the build inputs.
+          GPU inference and real-model LLGuidance acceptance are pending.
+          Upstream may log internal grammar errors and continue generation; strict failure is not guaranteed.
+          See licenses/ for bundled third-party license texts.
+          '@ | Set-Content package/README.txt
+
+          # Smoke test without finding DLLs in the build or CUDA installation directories.
+          $savedPath = $env:PATH
+          try {
+            $env:PATH = "$env:SystemRoot/System32;$env:SystemRoot"
+            $exe = (Resolve-Path package/llama-server.exe).Path
+            Invoke-Logged -Log version.txt -Command $exe -Arguments @('--version')
+          } finally {
+            $env:PATH = $savedPath
+          }
+          Copy-Item logs/version.txt package/
+          $packageRoot = (Resolve-Path package).Path
+          Get-ChildItem package -Recurse -File | Sort-Object FullName | ForEach-Object {
+            $relative = [IO.Path]::GetRelativePath($packageRoot, $_.FullName).Replace('\', '/')
+            "{0}  {1}" -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $relative
+          } | Set-Content logs/package-SHA256SUMS.txt
+          Copy-Item logs/package-SHA256SUMS.txt package/SHA256SUMS.txt
+          $zipName = "llama-149f5641-win-x64-cuda13.0.2-llguidance-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT.zip"
+          Compress-Archive -Path package/* -DestinationPath "dist/$zipName" -CompressionLevel Optimal
+          "{0}  {1}" -f (Get-FileHash "dist/$zipName" -Algorithm SHA256).Hash.ToLowerInvariant(), $zipName |
+            Set-Content "dist/$zipName.sha256"
+          Copy-Item package/build-info.json logs/
+          Copy-Item "dist/$zipName.sha256" logs/
+
+      - name: Upload Windows ZIP
+        id: zip
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: dist/*.zip
+          archive: false
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Preserve build diagnostics
+        if: always()
+        run: |
+          if (Test-Path build/CMakeCache.txt) { Copy-Item build/CMakeCache.txt logs/ -Force }
+          if (Test-Path build/CMakeFiles/CMakeConfigureLog.yaml) {
+            Copy-Item build/CMakeFiles/CMakeConfigureLog.yaml logs/ -Force
+          }
+
+      - name: Upload logs and checksums
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: llama-build-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: logs/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Show download link
+        if: success()
+        env:
+          ZIP_URL: ${{ steps.zip.outputs.artifact-url }}
+        run: |
+          @"
+          ## Windows CUDA + LLGuidance package
+          [Download the Windows ZIP]($env:ZIP_URL)
+
+          ZIP checksum and build evidence are in the logs artifact. Artifacts are retained for 14 days.
+          Compilation and version smoke test succeeded. GPU/model inference remains untested.
+          "@ >> $env:GITHUB_STEP_SUMMARY
