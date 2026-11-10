@@ -44,7 +44,7 @@
 +using json = common_json;
 +
 +// The native parser remains the response parser. Only its sampling grammar changes.
-+common_peg_parser common_chat_peg_builder::tool_input(const json & function,
++common_peg_parser common_chat_peg_builder::tool_input(const common_json & function,
 +                                                     const common_peg_parser & parser,
 +                                                     bool json_object) {
 +    if (!function.contains("input_grammar")) {
@@ -167,7 +167,7 @@
 +        if (markers.empty()) {
 +            throw std::invalid_argument("input_grammar: auto requires a native tool trigger");
 +        }
-+        auto prefix = build_peg_parser([&](common_peg_parser_builder & p) { return p.until(markers); });
++        auto prefix = build_peg_parser([&](common_peg_parser_builder & p) { return p.until_one_of(markers); });
 +        auto gbnf = build_grammar([&](const common_grammar_builder & b) { prefix.build_grammar(b); });
 +        llama_grammar_parser prefix_parsed;
 +        if (!prefix_parsed.parse(gbnf.c_str())) {
@@ -203,7 +203,7 @@
 +                    const auto & parameters = function.at("parameters");
 +                    const json input_schema = {{"type", "object"},
 +                        {"properties", {{"input", {{"type", "string"}}}}},
-+                        {"required", {"input"}}, {"additionalProperties", false}};
++                        {"required", json::array({"input"})}, {"additionalProperties", false}};
 +                    // v1 deliberately has one exact body slot, no arbitrary JSON paths.
 +                    if (!grammar.is_object() || grammar.size() != 2 || grammar.value("syntax", "") != "lark" ||
 +                        !grammar.contains("definition") || !grammar.at("definition").is_string() ||
@@ -499,7 +499,7 @@
 +endif()
 --- /dev/null
 +++ b/tests/test-tool-input-grammar.cpp
-@@ -0,0 +1,175 @@
+@@ -0,0 +1,192 @@
 +#ifdef NDEBUG
 +#undef NDEBUG
 +#endif
@@ -515,6 +515,7 @@
 +using json = common_json;
 +using matcher_ptr = std::unique_ptr<LlgMatcher, decltype(&llg_free_matcher)>;
 +static LlgTokenizer * tokenizer;
++static const std::vector<std::string> pieces = {"<tool_call>", "</tool_call>", "\\n", "\\\"", "<function", "</param>", "</function>"};
 +
 +static matcher_ptr matcher(const std::string & grammar) {
 +    LlgConstraintInit init;
@@ -522,18 +523,30 @@
 +    return matcher_ptr(llg_new_matcher(&init, "llguidance", grammar.c_str()), llg_free_matcher);
 +}
 +
-+static bool accepts(const std::string & grammar, const std::string & text) {
++static bool accepts(const std::string & grammar, const std::string & text, bool compound = false) {
 +    auto m = matcher(grammar);
 +    if (const char * error = llg_matcher_get_error(m.get())) {
 +        throw std::runtime_error(std::string(error) + "\n" + grammar);
 +    }
-+    for (unsigned char c : text) {
++    for (size_t pos = 0; pos < text.size();) {
++        uint32_t token = static_cast<unsigned char>(text[pos]);
++        size_t length = 1;
++        if (compound) {
++            for (size_t i = 0; i < pieces.size(); ++i) {
++                if (text.compare(pos, pieces[i].size(), pieces[i]) == 0) {
++                    token = 257 + i;
++                    length = pieces[i].size();
++                    break;
++                }
++            }
++        }
 +        assert(llg_matcher_compute_mask(m.get()) == 0);
 +        const auto * mask = llg_matcher_get_mask(m.get());
-+        if (!(mask[c / 32] & (1u << (c % 32)))) {
++        if (!(mask[token / 32] & (1u << (token % 32)))) {
 +            return false;
 +        }
-+        assert(llg_matcher_consume_token(m.get(), c) == 0);
++        assert(llg_matcher_consume_token(m.get(), token) == 0);
++        pos += length;
 +    }
 +    return llg_matcher_is_accepting(m.get());
 +}
@@ -547,10 +560,10 @@
 +
 +static json tool(const std::string & name, const std::string & grammar = "") {
 +    json schema = {{"type", "object"}, {"properties", {{"input", {{"type", "string"}}}}},
-+                   {"required", {"input"}}, {"additionalProperties", false}};
++                   {"required", json::array({"input"})}, {"additionalProperties", false}};
 +    if (grammar.empty()) {
 +        schema["properties"] = {{"path", {{"type", "string"}}}};
-+        schema["required"] = {"path"};
++        schema["required"] = json::array({"path"});
 +    }
 +    json function = {{"name", name}, {"description", name}, {"parameters", schema}};
 +    if (!grammar.empty()) {
@@ -585,7 +598,7 @@
 +
 +static void check(const common_chat_params & p, const std::string & text, bool valid) {
 +    const std::string prefill = p.grammar_lazy ? "" : p.generation_prompt;
-+    if (accepts(grammar(p), prefill + text) != valid) {
++    if (accepts(grammar(p), prefill + text) != valid || accepts(grammar(p), prefill + text, true) != valid) {
 +        throw std::runtime_error("unexpected acceptance: " + text + "\n" + grammar(p));
 +    }
 +}
@@ -603,8 +616,12 @@
 +    for (int c = 0; c < 256; ++c) { bytes.push_back(c); }
 +    lengths[256] = 4;
 +    bytes.insert(bytes.end(), {255, 'E', 'O', 'S'});
++    for (const auto & piece : pieces) {
++        lengths.push_back(piece.size());
++        bytes.insert(bytes.end(), piece.begin(), piece.end());
++    }
 +    LlgTokenizerInit ti = {};
-+    ti.vocab_size = 257;
++    ti.vocab_size = lengths.size();
 +    ti.tok_eos = 256;
 +    ti.token_lens = lengths.data();
 +    ti.token_bytes = bytes.data();
@@ -683,7 +700,7 @@
  
 +#ifdef LLAMA_USE_LLGUIDANCE
 +    props["native_tool_input_grammar"] = {{"version", 1}, {"syntax", "lark"},
-+        {"handlers", {"generic-json", "minicpm5-raw-no-lt"}}};
++        {"handlers", json::array({"generic-json", "minicpm5-raw-no-lt"})}};
 +#endif
 +
      if (!params.server_connect_code.empty()) {
