@@ -75,7 +75,7 @@
      };
      c.execute()
  }
-@@ -87,7 +99,86 @@
+@@ -87,7 +99,90 @@
      compile_lark(builder, parsed)
  }
  
@@ -131,6 +131,10 @@
 +                        bytes[byte as usize / 32] &= !mask;
 +                        encoded.push(self.builder.regex.add_ast(RegexAst::JsonQuote(
 +                            Box::new(RegexAst::Byte(byte)), JsonQuoteOptions::with_unicode_raw()))?);
++                        if byte == 127 {
++                            // DEL is legal unescaped JSON text too.
++                            encoded.push(self.builder.regex.add_ast(RegexAst::Byte(byte))?);
++                        }
 +                    }
 +                }
 +                encoded.push(self.builder.regex.add_ast(RegexAst::ByteSet(bytes))?);
@@ -162,7 +166,7 @@
      fn do_token(&mut self, name: &str) -> Result<RegexId> {
          if let Some(id) = self.regex_ids.get(name) {
              return Ok(*id);
-@@ -123,6 +214,7 @@
+@@ -123,6 +218,7 @@
                  Ok(self.builder.regex.optional(id))
              }
              Atom::Not(inner) => {
@@ -170,7 +174,7 @@
                  let id = self.do_token_atom(*inner)?;
                  Ok(self.builder.regex.not(id))
              }
-@@ -171,7 +263,10 @@
+@@ -171,7 +267,10 @@
                      };
                      self.mk_regex("regex", rx)
                  }
@@ -182,7 +186,7 @@
                  Value::SpecialToken(s) => {
                      bail!("special tokens (like {:?}) cannot be used in terminals", s);
                  }
-@@ -259,6 +354,14 @@
+@@ -259,6 +358,14 @@
      }
  
      fn lift_regex(&mut self, rx_id: RegexId) -> Result<NodeRef> {
@@ -197,7 +201,7 @@
          Ok(self.builder.lexeme(rx_id))
      }
  
-@@ -299,6 +402,11 @@
+@@ -299,6 +406,11 @@
                  Ok(self.lift_regex(rx)?)
              }
              Atom::Value(value) => {
@@ -209,7 +213,7 @@
                  match &value {
                      Value::Name(n) => {
                          if self.is_rule(n) {
-@@ -483,6 +591,10 @@
+@@ -483,6 +595,10 @@
              .remove(name)
              .ok_or_else(|| anyhow!("rule {:?} not found", name))?;
  
@@ -220,7 +224,7 @@
          self.in_progress
              .insert(name.to_string(), rule.is_parametric);
  
-@@ -622,13 +734,33 @@
+@@ -622,13 +738,33 @@
              serde_json::from_value(self.grammar.llguidance_options.clone())
                  .map_err(|e| anyhow!("failed to parse %llguidance declaration: {}", e))?;
  

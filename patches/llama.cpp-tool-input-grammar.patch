@@ -559,7 +559,7 @@
 +endif()
 --- /dev/null
 +++ b/tests/test-tool-input-grammar.cpp
-@@ -0,0 +1,245 @@
+@@ -0,0 +1,250 @@
 +#ifdef NDEBUG
 +#undef NDEBUG
 +#endif
@@ -725,8 +725,13 @@
 +    auto character = body_grammar(R"(start: /[^\r\n"]/)", "json_string");
 +    for (int c = 0; c < 128; ++c) {
 +        auto encoded = json(std::string(1, static_cast<char>(c))).dump();
-+        assert(accepts(character, "BEGIN" + encoded.substr(1, encoded.size() - 2) + "END") ==
-+               (c != '\r' && c != '\n' && c != '"'));
++        const auto sample = "BEGIN" + encoded.substr(1, encoded.size() - 2) + "END";
++        const bool expected = c != '\r' && c != '\n' && c != '"';
++        if (accepts(character, sample) != expected) {
++            std::cerr << "Character mismatch: " << c << " expected=" << expected << "\n";
++            accepts(character, sample, false, true);
++            throw std::runtime_error("JSON character class mismatch");
++        }
 +    }
 +    auto ignored = body_grammar("start: \"a\" \"\\\"\"\n%ignore /[\\n\\t ]+/", "json_string");
 +    assert(accepts(ignored, "BEGIN\\na\\t\\\"\\nEND"));
