@@ -1,9 +1,19 @@
 # Standalone: upload this one file to .github/workflows/ in any GitHub repository.
-# No AIOS checkout, model download, source patch, or automatic release publication.
+# Optional native tool grammar patches; no AIOS checkout, model download, or release publication.
 name: Build llama-server (Windows CUDA + LLGuidance)
 
 on:
   workflow_dispatch:
+    inputs:
+      native_tool_grammar:
+        description: Apply and test per-tool input grammar patches
+        type: boolean
+        default: false
+  push:
+    branches: [codex/native-tool-grammar]
+    paths:
+      - 'patches/**'
+      - '.github/workflows/build-llama.yml'
 
 permissions:
   contents: read
@@ -18,15 +28,69 @@ env:
   CUDA_VERSION: 13.0.2
   RUSTUP_TOOLCHAIN: 1.91.1-x86_64-pc-windows-msvc
   CARGO_BUILD_JOBS: '2'
+  NATIVE_TOOL_GRAMMAR: ${{ github.event_name == 'push' || inputs.native_tool_grammar }}
 
 jobs:
+  native-tests:
+    if: github.event_name == 'push' || inputs.native_tool_grammar
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: 1.91.1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: builder
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ env.LLAMA_REF }}
+          path: llama.cpp
+          persist-credentials: false
+      - name: Apply pinned patch and configure CPU tests
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.91.1 --profile minimal --no-self-update
+          git -C llama.cpp apply --check ../builder/patches/llama.cpp-tool-input-grammar.patch
+          git -C llama.cpp apply ../builder/patches/llama.cpp-tool-input-grammar.patch
+          cmake -S llama.cpp -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=OFF -DGGML_NATIVE=OFF \
+            -DLLAMA_LLGUIDANCE=ON -DLLGUIDANCE_PATCH="$PWD/builder/patches/llguidance-tool-input-grammar.patch" \
+            -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_UI=OFF
+      - name: Build and run native tests without a model
+        run: |
+          set -euo pipefail
+          cmake --build build --parallel 2 --target test-tool-input-grammar test-peg-parser test-chat-peg-parser test-json-schema-to-grammar
+          ctest --test-dir build --output-on-failure --output-junit native-tests.xml \
+            -R '^(test-tool-input-grammar|test-peg-parser|test-chat-peg-parser|test-json-schema-to-grammar)$'
+      - name: Preserve test evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: native-tool-grammar-tests-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build/native-tests.xml
+            build/Testing/Temporary/
+            build/CMakeCache.txt
+          retention-days: 14
+          if-no-files-found: warn
+
   build:
+    needs: native-tests
+    if: always() && (needs.native-tests.result == 'success' || needs.native-tests.result == 'skipped')
     runs-on: windows-2022
     timeout-minutes: 240
     defaults:
       run:
         shell: pwsh
     steps:
+      - name: Get build inputs
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: builder
+          persist-credentials: false
       - name: Prepare artifact directories
         run: |
           New-Item -ItemType Directory -Path logs, dist, package, package/licenses -Force | Out-Null
@@ -39,6 +103,14 @@ jobs:
           path: llama.cpp
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Apply native tool grammar patch
+        if: env.NATIVE_TOOL_GRAMMAR == 'true'
+        run: |
+          git -C llama.cpp apply --check ../builder/patches/llama.cpp-tool-input-grammar.patch
+          if ($LASTEXITCODE -ne 0) { throw 'Native patch does not match pinned source' }
+          git -C llama.cpp apply ../builder/patches/llama.cpp-tool-input-grammar.patch
+          if ($LASTEXITCODE -ne 0) { throw 'Native patch failed' }
 
       - name: Prepare CMake, Ninja and Rust
         run: |
@@ -123,6 +195,10 @@ jobs:
             '-DLLAMA_BUILD_APP=OFF', '-DLLAMA_BUILD_UI=OFF', '-DLLAMA_BUILD_BORINGSSL=ON',
             '-DBORINGSSL_GIT=https://github.com/google/boringssl.git'
           )
+          if ($env:NATIVE_TOOL_GRAMMAR -eq 'true') {
+            $patchPath = (Resolve-Path builder/patches/llguidance-tool-input-grammar.patch).Path.Replace('\', '/')
+            $configure += "-DLLGUIDANCE_PATCH=$patchPath"
+          }
           $configure | Set-Content logs/cmake-arguments.txt
           Invoke-Logged -Log configure.log -Command cmake -Arguments $configure
           Invoke-Logged -Log build.log -Command cmake -Arguments @('--build', 'build', '--config', 'Release', '--target', 'llama-server', '--parallel', '2')
@@ -131,7 +207,14 @@ jobs:
           if ((git -C $llgSource rev-parse HEAD).Trim() -ne $env:LLGUIDANCE_REF) { throw 'LLGuidance commit mismatch' }
           foreach ($source in @('llama.cpp', $llgSource)) {
             $changes = git -C $source status --porcelain --untracked-files=no
-            if ($LASTEXITCODE -ne 0 -or $changes) { throw "Tracked source was modified: $source" }
+            if ($LASTEXITCODE -ne 0) { throw "Cannot inspect source: $source" }
+            if ($env:NATIVE_TOOL_GRAMMAR -ne 'true' -and $changes) { throw "Tracked source was modified: $source" }
+            if ($env:NATIVE_TOOL_GRAMMAR -eq 'true') {
+              $patchName = if ($source -eq 'llama.cpp') { 'llama.cpp' } else { 'llguidance' }
+              $patchFile = (Resolve-Path "builder/patches/$patchName-tool-input-grammar.patch").Path
+              git -C $source apply --reverse --check $patchFile
+              if ($LASTEXITCODE -ne 0) { throw "Expected patch missing from $source" }
+            }
           }
           $cache = Get-Content build/CMakeCache.txt -Raw
           foreach ($flag in @('LLAMA_LLGUIDANCE:BOOL=ON', 'GGML_CUDA:BOOL=ON')) {
@@ -191,27 +274,35 @@ jobs:
             runner_image = $env:ImageVersion
           }
           $versions | ConvertTo-Json | Set-Content logs/toolchain.json
+          $patches = @()
+          if ($env:NATIVE_TOOL_GRAMMAR -eq 'true') {
+            $patches = @(Get-ChildItem builder/patches/*.patch | Sort-Object Name | ForEach-Object {
+              @{ name = $_.Name; sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
+            })
+            Copy-Item builder/patches package/patches -Recurse
+          }
           $manifest = [ordered]@{
             llama_commit = $env:LLAMA_REF
             llguidance_commit = $env:LLGUIDANCE_REF
             cuda = $env:CUDA_VERSION
-            patches = @()
+            patches = $patches
             configure_arguments = $configure
             toolchain = $versions
             run_url = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
             workflow_commit = $env:GITHUB_SHA
             gpu_inference = 'not tested; this runner has no NVIDIA GPU'
             llguidance_inference = 'not tested; no model is downloaded'
-            strict_grammar_failure = 'not guaranteed; unmodified upstream behavior'
+            strict_grammar_failure = $(if ($env:NATIVE_TOOL_GRAMMAR -eq 'true') { 'sampler errors fail the request; real-model validation pending' } else { 'not guaranteed; unmodified upstream behavior' })
+            native_tests = $(if ($env:NATIVE_TOOL_GRAMMAR -eq 'true') { 'passed in prerequisite CPU job; no model loaded' } else { 'not run' })
           }
           $manifest | ConvertTo-Json -Depth 5 | Set-Content package/build-info.json
           @'
-          Windows x64 llama-server with CUDA 13.0.2 and LLGuidance; no source patches.
+          Windows x64 llama-server with CUDA 13.0.2 and LLGuidance. See build-info.json for applied patches.
           Keep the EXE and all DLLs in this directory together.
           Requires a compatible NVIDIA GPU and CUDA 13-capable NVIDIA driver for GPU inference.
           CUDA 13 does not cover older pre-Turing GPUs. See build-info.json for the build inputs.
           GPU inference and real-model LLGuidance acceptance are pending.
-          Upstream may log internal grammar errors and continue generation; strict failure is not guaranteed.
+          Unpatched mode retains upstream error handling. Patched capabilities and verification are recorded in build-info.json.
           See licenses/ for bundled third-party license texts.
           '@ | Set-Content package/README.txt
 
@@ -231,7 +322,8 @@ jobs:
             "{0}  {1}" -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $relative
           } | Set-Content logs/package-SHA256SUMS.txt
           Copy-Item logs/package-SHA256SUMS.txt package/SHA256SUMS.txt
-          $zipName = "llama-149f5641-win-x64-cuda13.0.2-llguidance-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT.zip"
+          $variant = if ($env:NATIVE_TOOL_GRAMMAR -eq 'true') { '-tool-grammar' } else { '' }
+          $zipName = "llama-149f5641-win-x64-cuda13.0.2-llguidance$variant-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT.zip"
           Compress-Archive -Path package/* -DestinationPath "dist/$zipName" -CompressionLevel Optimal
           "{0}  {1}" -f (Get-FileHash "dist/$zipName" -Algorithm SHA256).Hash.ToLowerInvariant(), $zipName |
             Set-Content "dist/$zipName.sha256"

@@ -1,0 +1,156 @@
+--- a/parser/src/api.rs
++++ b/parser/src/api.rs
+@@ -72,6 +72,9 @@
+     /// The Lark grammar that the grammar should generate.
+     /// When this is set, nodes and rx_nodes must be empty.
+     pub lark_grammar: Option<String>,
++    /// Native tool body encoding; None preserves ordinary Lark behavior.
++    #[serde(default)]
++    pub tool_input_mode: Option<String>,
+     // #[serde(flatten)]
+     // pub options: LLGuidanceOptions,
+ }
+--- a/parser/src/earley/from_guidance.rs
++++ b/parser/src/earley/from_guidance.rs
+@@ -25,12 +25,12 @@
+         let res = if let Some(lark) = input.lark_grammar {
+             #[cfg(feature = "lark")]
+             {
+-                use crate::lark::lark_to_llguidance;
++                use crate::lark::lark_tool_input;
+                 ensure!(
+                     input.json_schema.is_none(),
+                     "cannot have both lark_grammar and json_schema"
+                 );
+-                lark_to_llguidance(builder, &lark)?
++                lark_tool_input(builder, &lark, input.tool_input_mode)?
+             }
+             #[cfg(not(feature = "lark"))]
+             {
+@@ -38,6 +38,7 @@
+                 bail!("lark_grammar is not supported in this build")
+             }
+         } else if let Some(json_schema) = input.json_schema {
++            ensure!(input.tool_input_mode.is_none(), "tool_input_mode requires lark_grammar");
+             JsonCompileOptions::default().json_to_llg_with_overrides(builder, json_schema)?
+         } else {
+             bail!("grammar must have either lark_grammar or json_schema");
+--- a/parser/src/lark/compiler.rs
++++ b/parser/src/lark/compiler.rs
+@@ -5,7 +5,7 @@
+     HashMap,
+ };
+ use anyhow::{anyhow, bail, ensure, Result};
+-use derivre::RegexAst;
++use derivre::{JsonQuoteOptions, RegexAst};
+ 
+ use crate::{
+     api::{GenGrammarOptions, GenOptions, GrammarId, LLGuidanceOptions, NodeProps, RegexExt},
+@@ -63,9 +63,16 @@
+     regex_ids: HashMap<String, RegexId>,
+     in_progress: HashMap<String, bool>,
+     pending_grammars: Vec<(NodeRef, Location, PendingGrammar)>,
++    tool_input_mode: Option<String>,
+ }
+ 
+ fn compile_lark(builder: GrammarBuilder, parsed: ParsedLark) -> Result<GrammarResult> {
++    compile_lark_body(builder, parsed, None)
++}
++
++fn compile_lark_body(builder: GrammarBuilder, parsed: ParsedLark, tool_input_mode: Option<String>) -> Result<GrammarResult> {
++    ensure!(matches!(tool_input_mode.as_deref(), None | Some("json_string") | Some("raw_no_lt")),
++            "unsupported tool_input_mode");
+     let c = Compiler {
+         builder,
+         parsed,
+@@ -74,6 +81,7 @@
+         regex_ids: HashMap::default(),
+         in_progress: HashMap::default(),
+         pending_grammars: vec![],
++        tool_input_mode,
+     };
+     c.execute()
+ }
+@@ -87,7 +95,27 @@
+     compile_lark(builder, parsed)
+ }
+ 
++pub fn lark_tool_input(builder: GrammarBuilder, lark: &str, mode: Option<String>) -> Result<GrammarResult> {
++    compile_lark_body(builder, parse_lark(lark)?, mode)
++}
++
+ impl Compiler {
++    fn body_regex(&mut self, rx: RegexId) -> Result<RegexId> {
++        match self.tool_input_mode.as_deref() {
++            Some("json_string") => self.builder.regex.add_ast(RegexAst::JsonQuote(
++                Box::new(RegexAst::ExprRef(rx)), JsonQuoteOptions::with_unicode_raw())),
++            Some("raw_no_lt") => {
++                // Reject, rather than silently narrow, a grammar that can close an XML tag.
++                let bad = self.builder.regex.add_ast(RegexAst::And(vec![
++                    RegexAst::ExprRef(rx), RegexAst::Regex("(?s:.*<.*)".to_string())]))?;
++                let mut check = self.builder.regex.spec.regex_builder.clone().to_regex_limited(bad, 1_000_000)?;
++                ensure!(check.always_empty(), "raw tool input grammar may emit '<'; this encoding is unsupported");
++                Ok(rx)
++            }
++            _ => Ok(rx),
++        }
++    }
++
+     fn do_token(&mut self, name: &str) -> Result<RegexId> {
+         if let Some(id) = self.regex_ids.get(name) {
+             return Ok(*id);
+@@ -259,6 +287,7 @@
+     }
+ 
+     fn lift_regex(&mut self, rx_id: RegexId) -> Result<NodeRef> {
++        let rx_id = self.body_regex(rx_id)?;
+         Ok(self.builder.lexeme(rx_id))
+     }
+ 
+@@ -299,6 +328,11 @@
+                 Ok(self.lift_regex(rx)?)
+             }
+             Atom::Value(value) => {
++                if self.tool_input_mode.is_some() {
++                    ensure!(!matches!(&value, Value::SpecialToken(_) | Value::GrammarRef(_) |
++                        Value::NestedLark(_) | Value::Json(_) | Value::RegexExt(_)),
++                        "tool input supports text Lark only, without nested grammars or special tokens");
++                }
+                 match &value {
+                     Value::Name(n) => {
+                         if self.is_rule(n) {
+@@ -483,6 +517,10 @@
+             .remove(name)
+             .ok_or_else(|| anyhow!("rule {:?} not found", name))?;
+ 
++        if self.tool_input_mode.is_some() {
++            ensure!(rule.stop_like().is_none() && rule.temperature.is_none() && rule.max_tokens.is_none() &&
++                    !rule.is_parametric, "tool input does not support generation attributes or parametric rules");
++        }
+         self.in_progress
+             .insert(name.to_string(), rule.is_parametric);
+ 
+@@ -622,9 +660,14 @@
+             serde_json::from_value(self.grammar.llguidance_options.clone())
+                 .map_err(|e| anyhow!("failed to parse %llguidance declaration: {}", e))?;
+ 
++        ensure!(self.tool_input_mode.is_none() || !opts.allow_invalid_utf8,
++                "tool input requires valid UTF-8");
+         let ignore = ignore
+             .into_iter()
+-            .map(|exp| Ok(RegexAst::ExprRef(self.do_token_expansions(exp)?)))
++            .map(|exp| {
++                let rx = self.do_token_expansions(exp)?;
++                Ok(RegexAst::ExprRef(self.body_regex(rx)?))
++            })
+             .collect::<Result<Vec<_>>>()?;
+         let id = self.builder.add_grammar(opts, RegexAst::Or(ignore))?;
+ 
+--- a/parser/src/lark/mod.rs
++++ b/parser/src/lark/mod.rs
+@@ -4,4 +4,4 @@
+ mod lexer;
+ mod parser;
+ 
+-pub use compiler::lark_to_llguidance;
++pub use compiler::{lark_to_llguidance, lark_tool_input};
