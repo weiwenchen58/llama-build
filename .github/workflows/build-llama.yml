@@ -20,7 +20,7 @@ permissions:
 
 concurrency:
   group: build-llama-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.ref == 'refs/heads/codex/native-tool-grammar' }}
 
 env:
   LLAMA_REF: 149f5641b931aaf33697d70f9abc90c3e5300247

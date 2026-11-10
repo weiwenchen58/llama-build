@@ -33,7 +33,7 @@
      common_peg_parser permute(const std::string & rule_prefix, const std::vector<common_peg_parser> & parsers);
 --- /dev/null
 +++ b/common/chat-tool-grammar.cpp
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,153 @@
 +#include "chat-peg-parser.h"
 +#include "json-schema-to-grammar.h"
 +#include "../src/llama-grammar.h"
@@ -109,7 +109,10 @@
 +void common_chat_apply_tool_grammars(common_chat_params & data, const std::vector<common_chat_tool> & tools,
 +                                    common_chat_tool_choice choice) {
 +    std::set<std::string> expected;
++    std::set<std::string> names;
++    bool duplicate_name = false;
 +    for (const auto & tool : tools) {
++        duplicate_name |= !names.insert(tool.name).second;
 +        if (!tool.input_grammar.empty()) {
 +            if (!expected.insert(tool.name).second) {
 +                throw std::invalid_argument("input_grammar: duplicate tool name");
@@ -118,6 +121,9 @@
 +    }
 +    if (expected.empty() || choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
 +        return;
++    }
++    if (duplicate_name) {
++        throw std::invalid_argument("input_grammar: duplicate tool name");
 +    }
 +#ifndef LLAMA_USE_LLGUIDANCE
 +    throw std::invalid_argument("input_grammar requires a build with LLAMA_LLGUIDANCE=ON");
@@ -193,7 +199,7 @@
          if (tool.defer_loading) {
              function["defer_loading"] = true;
          }
-@@ -677,11 +680,27 @@
+@@ -677,11 +680,30 @@
                      throw std::invalid_argument("Expected 'defer_loading' to be a boolean, got " + defer.dump());
                  }
  
@@ -201,13 +207,16 @@
 +                if (function.contains("input_grammar")) {
 +                    const auto & grammar = function.at("input_grammar");
 +                    const auto & parameters = function.at("parameters");
-+                    const json input_schema = {{"type", "object"},
-+                        {"properties", {{"input", {{"type", "string"}}}}},
-+                        {"required", json::array({"input"})}, {"additionalProperties", false}};
++                    const bool input_schema = parameters.is_object() && parameters.size() == 4 &&
++                        parameters.value("type", "") == "object" &&
++                        parameters.contains("properties") &&
++                        parameters.at("properties") == json{{"input", {{"type", "string"}}}} &&
++                        parameters.contains("required") && parameters.at("required") == json::array({"input"}) &&
++                        !parameters.value("additionalProperties", true);
 +                    // v1 deliberately has one exact body slot, no arbitrary JSON paths.
 +                    if (!grammar.is_object() || grammar.size() != 2 || grammar.value("syntax", "") != "lark" ||
 +                        !grammar.contains("definition") || !grammar.at("definition").is_string() ||
-+                        grammar.at("definition").get<std::string>().empty() || parameters != input_schema) {
++                        grammar.at("definition").get<std::string>().empty() || !input_schema) {
 +                        throw std::invalid_argument("input_grammar requires Lark and exactly one required string input");
 +                    }
 +                    input_grammar = grammar.at("definition").get<std::string>();
@@ -221,7 +230,7 @@
                  });
              }
          }
-@@ -1678,8 +1697,10 @@
+@@ -1678,8 +1700,10 @@
  common_chat_params common_chat_templates_apply(const struct common_chat_templates *        tmpls,
                                                 const struct common_chat_templates_inputs & inputs) {
      GGML_ASSERT(tmpls != nullptr);
@@ -267,7 +276,7 @@
      set(LLGUIDANCE_PATH ${LLGUIDANCE_SRC}/target/release)
      set(LLGUIDANCE_LIB_NAME "${CMAKE_STATIC_LIBRARY_PREFIX}llguidance${CMAKE_STATIC_LIBRARY_SUFFIX}")
  
-@@ -167,7 +174,8 @@
+@@ -167,14 +174,15 @@
          SOURCE_DIR ${LLGUIDANCE_SRC}
          BUILD_IN_SOURCE TRUE
          CONFIGURE_COMMAND ""
@@ -277,6 +286,14 @@
          INSTALL_COMMAND ""
          BUILD_BYPRODUCTS ${LLGUIDANCE_PATH}/${LLGUIDANCE_LIB_NAME} ${LLGUIDANCE_PATH}/llguidance.h
          UPDATE_COMMAND ""
+     )
+     target_compile_definitions(${TARGET} PUBLIC LLAMA_USE_LLGUIDANCE)
+ 
+-    add_library(llguidance STATIC IMPORTED)
++    add_library(llguidance STATIC IMPORTED GLOBAL)
+     set_target_properties(llguidance PROPERTIES IMPORTED_LOCATION ${LLGUIDANCE_PATH}/${LLGUIDANCE_LIB_NAME})
+     add_dependencies(llguidance llguidance_ext)
+ 
 --- a/common/llguidance.cpp
 +++ b/common/llguidance.cpp
 @@ -1,5 +1,9 @@
@@ -499,7 +516,7 @@
 +endif()
 --- /dev/null
 +++ b/tests/test-tool-input-grammar.cpp
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,207 @@
 +#ifdef NDEBUG
 +#undef NDEBUG
 +#endif
@@ -508,6 +525,7 @@
 +
 +#include <cassert>
 +#include <fstream>
++#include <functional>
 +#include <iostream>
 +#include <memory>
 +#include <sstream>
@@ -609,6 +627,12 @@
 +    return common_chat_parse(common_chat_input(text), partial, pp);
 +}
 +
++static void expect_error(const std::function<void()> & action) {
++    bool failed = false;
++    try { action(); } catch (const std::exception &) { failed = true; }
++    assert(failed);
++}
++
 +int main() {
 +    // A byte vocabulary exercises token masks without any model or tokenizer download.
 +    std::vector<uint32_t> lengths(257, 1);
@@ -652,6 +676,14 @@
 +    assert(llg_matcher_get_error(invalid.get()));
 +
 +    auto tools = json::array({tool("read_file"), tool("apply_patch", patch), tool("calculate", recursive)});
++    auto reordered = tool("calculate", recursive);
++    reordered["function"]["parameters"] = json::parse(R"({"additionalProperties":false,"required":["input"],"properties":{"input":{"type":"string"}},"type":"object"})");
++    assert(common_chat_tools_parse_oaicompat(json::array({reordered})).size() == 1);
++    auto invalid_schema = reordered;
++    invalid_schema["function"]["parameters"]["required"] = json::array();
++    expect_error([&] { common_chat_tools_parse_oaicompat(json::array({invalid_schema})); });
++    expect_error([&] { apply("Qwen-Qwen2.5-7B-Instruct.jinja", json::array({tool("calculate"), reordered}), false, true); });
++    expect_error([&] { apply("Qwen3-Coder.jinja", json::array({reordered}), false, true); });
 +    const std::string call = "<tool_call>\n{\"name\": \"calculate\", \"arguments\": {\"input\":\"(1+(2+3))\"}}\n</tool_call>";
 +    const std::string read = "<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"README.md\"}}\n</tool_call>";
 +    const std::string patch_text = "*** Begin Patch\n*** Delete File: old.txt\n*** End Patch";

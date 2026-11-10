@@ -1,6 +1,6 @@
 # Windows llama-server 构建
 
-手动编译官方 llama.cpp + LLGuidance + CUDA，不应用额外源码补丁。
+编译固定版本 llama.cpp + LLGuidance + CUDA。默认手动模式不应用额外源码补丁；`native_tool_grammar` 输入可启用原生工具正文 grammar 补丁。
 
 ## 运行与下载
 
@@ -10,7 +10,15 @@
 4. 成功后在摘要点击 Download the Windows ZIP，或在 Artifacts 下载。
 5. llama-build-logs 包含日志和 ZIP 校验值。产物保留 14 天。
 
-只在手动运行时构建，不自动发布 Release。构建机无需 NVIDIA GPU；运行模型的电脑需要兼容的显卡及驱动。完整解压，保留 EXE 和 DLL 在同一目录。
+默认模式手动运行；`codex/native-tool-grammar` 分支的补丁和工作流推送自动执行补丁模式。不会自动发布 Release。构建机无需 NVIDIA GPU；运行模型的电脑需要兼容的显卡及驱动。完整解压，保留 EXE 和 DLL 在同一目录。
+
+需要重新运行补丁分支时，可使用 GitHub CLI：
+
+```sh
+gh workflow run build-llama.yml --repo weiwenchen58/llama-build --ref codex/native-tool-grammar -f native_tool_grammar=true
+```
+
+补丁模式先编译 Linux CPU 服务器与针对性测试，测试通过才进入 Windows CUDA 打包。ZIP 名称包含 `tool-grammar`，`build-info.json` 记录补丁 SHA256 与验证范围。详细契约与限制见[补丁说明](../../patches/README.md)。
 
 ## 构建输入和验证边界
 
@@ -20,6 +28,6 @@
 - CMake 3.31.10；Ninja 1.13.0；Windows 2022 runner
 - CUDA 13 不覆盖早于 Turing 的显卡。
 
-工作流检查编译、依赖和 --version 基础启动。实际构建状态以 Actions 为准；真实模型推理、GPU 卸载和 LLGuidance 约束效果仍须在目标电脑验收。采用官方错误处理行为，不承诺所有内部 grammar 故障立即终止生成。
+工作流检查编译、依赖和 --version 基础启动。补丁模式额外执行真实 grammar 编译、token mask 和原生 parser 测试，使用合成词表，不下载或加载模型。实际构建状态以 Actions 为准；真实模型推理、GPU 卸载、质量和性能仍须在目标电脑验收。无补丁模式保留上游错误处理行为；补丁模式将 matcher 错误传播为请求失败。
 
 [构建配置](build-llama.yml)
