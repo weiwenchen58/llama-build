@@ -66,8 +66,9 @@
      common_peg_parser permute(const std::string & rule_prefix, const std::vector<common_peg_parser> & parsers);
 --- /dev/null
 +++ b/common/chat-tool-grammar.cpp
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,157 @@
 +#include "chat-peg-parser.h"
++#include "common.h"
 +#include "json-schema-to-grammar.h"
 +#include "../src/llama-grammar.h"
 +
@@ -198,10 +199,11 @@
 +    if (data.grammar_lazy) {
 +        std::vector<std::string> markers;
 +        for (const auto & trigger : data.grammar_triggers) {
-+            if (trigger.type != COMMON_GRAMMAR_TRIGGER_TYPE_WORD || trigger.value.empty()) {
++            const auto marker = trim_whitespace(trigger.value);
++            if (trigger.type != COMMON_GRAMMAR_TRIGGER_TYPE_WORD || marker.empty()) {
 +                throw std::invalid_argument("input_grammar: only native word triggers are supported");
 +            }
-+            markers.push_back(trigger.value);
++            markers.push_back(marker);
 +        }
 +        if (markers.empty()) {
 +            throw std::invalid_argument("input_grammar: auto requires a native tool trigger");
@@ -557,7 +559,7 @@
 +endif()
 --- /dev/null
 +++ b/tests/test-tool-input-grammar.cpp
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,231 @@
 +#ifdef NDEBUG
 +#undef NDEBUG
 +#endif
@@ -565,6 +567,7 @@
 +#include "llguidance.h"
 +
 +#include <cassert>
++#include <algorithm>
 +#include <fstream>
 +#include <functional>
 +#include <iostream>
@@ -582,7 +585,7 @@
 +    return matcher_ptr(llg_new_matcher(&init, "llguidance", grammar.c_str()), llg_free_matcher);
 +}
 +
-+static bool accepts(const std::string & grammar, const std::string & text, bool compound = false) {
++static bool accepts(const std::string & grammar, const std::string & text, bool compound = false, bool diagnostic = false) {
 +    auto m = matcher(grammar);
 +    if (const char * error = llg_matcher_get_error(m.get())) {
 +        throw std::runtime_error(std::string(error) + "\n" + grammar);
@@ -602,6 +605,7 @@
 +        assert(llg_matcher_compute_mask(m.get()) == 0);
 +        const auto * mask = llg_matcher_get_mask(m.get());
 +        if (!(mask[token / 32] & (1u << (token % 32)))) {
++            if (diagnostic) { std::cerr << "Rejected at byte " << pos << ": " << json(text.substr(pos, length)).dump() << "\n"; }
 +            return false;
 +        }
 +        assert(llg_matcher_consume_token(m.get(), token) == 0);
@@ -658,7 +662,12 @@
 +
 +static void check(const common_chat_params & p, const std::string & text, bool valid) {
 +    const std::string prefill = p.grammar_lazy ? "" : p.generation_prompt;
-+    if (accepts(grammar(p), prefill + text) != valid || accepts(grammar(p), prefill + text, true) != valid) {
++    const bool bytes = accepts(grammar(p), prefill + text);
++    const bool compound = accepts(grammar(p), prefill + text, true);
++    if (bytes != valid || compound != valid) {
++        std::cerr << "Expected=" << valid << " byte=" << bytes << " compound=" << compound << "\n";
++        accepts(grammar(p), prefill + text, false, true);
++        accepts(grammar(p), prefill + text, true, true);
 +        throw std::runtime_error("unexpected acceptance: " + text + "\n" + grammar(p));
 +    }
 +}
@@ -729,6 +738,9 @@
 +    const std::string call = "<tool_call>\n{\"name\": \"calculate\", \"arguments\": {\"input\":\"(1+(2+3))\"}}\n</tool_call>";
 +    const std::string read = "<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"README.md\"}}\n</tool_call>";
 +    const std::string patch_text = "*** Begin Patch\n*** Delete File: old.txt\n*** End Patch";
++    auto encoded_patch = json(patch_text).dump();
++    const auto patch_body = body_grammar(patch, "json_string");
++    assert(accepts(patch_body, "BEGIN" + encoded_patch.substr(1, encoded_patch.size() - 2) + "END", false, true));
 +    const std::string patch_call = "<tool_call>\n{\"name\": \"apply_patch\", \"arguments\": {\"input\":" + json(patch_text).dump() + "}}\n</tool_call>";
 +    auto p = apply("Qwen-Qwen2.5-7B-Instruct.jinja", tools, false, true);
 +    check(p, "Hello", true);
@@ -740,6 +752,10 @@
 +    auto bad_call = call;
 +    bad_call.replace(bad_call.find("(1+(2+3))"), 9, "(1*2)");
 +    check(p, bad_call, false);
++    // A malformed marker must not bypass constraints through the free-text prefix.
++    auto compact_bad = bad_call;
++    compact_bad.erase(std::remove(compact_bad.begin(), compact_bad.end(), '\n'), compact_bad.end());
++    check(p, compact_bad, false);
 +    auto wrong_body = call;
 +    wrong_body.replace(wrong_body.find("calculate"), std::string("calculate").size(), "apply_patch");
 +    check(p, wrong_body, false);

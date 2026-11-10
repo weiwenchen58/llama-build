@@ -71,11 +71,14 @@
      };
      c.execute()
  }
-@@ -87,7 +95,27 @@
+@@ -87,7 +95,30 @@
      compile_lark(builder, parsed)
  }
  
 +pub fn lark_tool_input(builder: GrammarBuilder, lark: &str, mode: Option<String>) -> Result<GrammarResult> {
++    if mode.is_none() {
++        return lark_to_llguidance(builder, lark);
++    }
 +    compile_lark_body(builder, parse_lark(lark)?, mode)
 +}
 +
@@ -88,7 +91,7 @@
 +                // Reject, rather than silently narrow, a grammar that can close an XML tag.
 +                let bad = self.builder.regex.add_ast(RegexAst::And(vec![
 +                    RegexAst::ExprRef(rx), RegexAst::Regex("(?s:.*<.*)".to_string())]))?;
-+                let mut check = self.builder.regex.spec.regex_builder.clone().to_regex_limited(bad, 1_000_000)?;
++                let mut check = self.builder.regex.spec.regex_builder.to_regex_limited(bad, 1_000_000)?;
 +                ensure!(check.always_empty(), "raw tool input grammar may emit '<'; this encoding is unsupported");
 +                Ok(rx)
 +            }
@@ -99,7 +102,7 @@
      fn do_token(&mut self, name: &str) -> Result<RegexId> {
          if let Some(id) = self.regex_ids.get(name) {
              return Ok(*id);
-@@ -123,6 +151,7 @@
+@@ -123,6 +154,7 @@
                  Ok(self.builder.regex.optional(id))
              }
              Atom::Not(inner) => {
@@ -107,7 +110,7 @@
                  let id = self.do_token_atom(*inner)?;
                  Ok(self.builder.regex.not(id))
              }
-@@ -171,7 +200,10 @@
+@@ -171,7 +203,10 @@
                      };
                      self.mk_regex("regex", rx)
                  }
@@ -119,7 +122,7 @@
                  Value::SpecialToken(s) => {
                      bail!("special tokens (like {:?}) cannot be used in terminals", s);
                  }
-@@ -259,6 +291,7 @@
+@@ -259,6 +294,7 @@
      }
  
      fn lift_regex(&mut self, rx_id: RegexId) -> Result<NodeRef> {
@@ -127,7 +130,7 @@
          Ok(self.builder.lexeme(rx_id))
      }
  
-@@ -299,6 +332,11 @@
+@@ -299,6 +335,11 @@
                  Ok(self.lift_regex(rx)?)
              }
              Atom::Value(value) => {
@@ -139,7 +142,7 @@
                  match &value {
                      Value::Name(n) => {
                          if self.is_rule(n) {
-@@ -483,6 +521,10 @@
+@@ -483,6 +524,10 @@
              .remove(name)
              .ok_or_else(|| anyhow!("rule {:?} not found", name))?;
  
@@ -150,7 +153,7 @@
          self.in_progress
              .insert(name.to_string(), rule.is_parametric);
  
-@@ -622,9 +664,14 @@
+@@ -622,9 +667,14 @@
              serde_json::from_value(self.grammar.llguidance_options.clone())
                  .map_err(|e| anyhow!("failed to parse %llguidance declaration: {}", e))?;
  
