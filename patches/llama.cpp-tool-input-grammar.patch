@@ -559,7 +559,7 @@
 +endif()
 --- /dev/null
 +++ b/tests/test-tool-input-grammar.cpp
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,245 @@
 +#ifdef NDEBUG
 +#undef NDEBUG
 +#endif
@@ -718,6 +718,18 @@
 +    assert(accepts(body, "BEGIN" + quoted.substr(1, quoted.size() - 2) + "END"));
 +    assert(!accepts(body, "BEGIN" + literal + "END"));
 +    assert(accepts(body_grammar("start: \"\"", "json_string"), "BEGINEND"));
++    auto controls = body_grammar("start: /[\\x00-\\x1f]+/", "json_string");
++    assert(accepts(controls, "BEGIN\\n\\tEND"));
++    assert(!accepts(controls, "BEGIN\\\"END"));
++    assert(!accepts(controls, "BEGIN\\\\END"));
++    auto character = body_grammar(R"(start: /[^\r\n"]/)", "json_string");
++    for (int c = 0; c < 128; ++c) {
++        auto encoded = json(std::string(1, static_cast<char>(c))).dump();
++        assert(accepts(character, "BEGIN" + encoded.substr(1, encoded.size() - 2) + "END") ==
++               (c != '\r' && c != '\n' && c != '"'));
++    }
++    auto ignored = body_grammar("start: \"a\" \"\\\"\"\n%ignore /[\\n\\t ]+/", "json_string");
++    assert(accepts(ignored, "BEGIN\\na\\t\\\"\\nEND"));
 +    assert(accepts(body_grammar(recursive, "raw_no_lt"), "BEGIN(1+2)END"));
 +    for (const auto & invalid : {"start: /(?s:.*)/", "start: \"<\"", "start: A\nA: /</"}) {
 +        auto m = matcher(body_grammar(invalid, "raw_no_lt"));
@@ -741,6 +753,8 @@
 +    auto encoded_patch = json(patch_text).dump();
 +    const auto patch_body = body_grammar(patch, "json_string");
 +    assert(accepts(patch_body, "BEGIN" + encoded_patch.substr(1, encoded_patch.size() - 2) + "END", false, true));
++    auto escaped_path = json(std::string("*** Begin Patch\n*** Delete File: dir\\q\"file.txt\n*** End Patch")).dump();
++    assert(accepts(patch_body, "BEGIN" + escaped_path.substr(1, escaped_path.size() - 2) + "END", true, true));
 +    const std::string patch_call = "<tool_call>\n{\"name\": \"apply_patch\", \"arguments\": {\"input\":" + json(patch_text).dump() + "}}\n</tool_call>";
 +    auto p = apply("Qwen-Qwen2.5-7B-Instruct.jinja", tools, false, true);
 +    check(p, "Hello", true);

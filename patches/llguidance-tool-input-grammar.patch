@@ -46,11 +46,13 @@
  
  use crate::{
      api::{GenGrammarOptions, GenOptions, GrammarId, LLGuidanceOptions, NodeProps, RegexExt},
-@@ -63,9 +63,16 @@
+@@ -63,9 +63,18 @@
      regex_ids: HashMap<String, RegexId>,
      in_progress: HashMap<String, bool>,
      pending_grammars: Vec<(NodeRef, Location, PendingGrammar)>,
 +    tool_input_mode: Option<String>,
++    body_nodes: HashMap<RegexId, NodeRef>,
++    body_skip: Option<NodeRef>,
  }
  
  fn compile_lark(builder: GrammarBuilder, parsed: ParsedLark) -> Result<GrammarResult> {
@@ -63,15 +65,17 @@
      let c = Compiler {
          builder,
          parsed,
-@@ -74,6 +81,7 @@
+@@ -74,6 +83,9 @@
          regex_ids: HashMap::default(),
          in_progress: HashMap::default(),
          pending_grammars: vec![],
 +        tool_input_mode,
++        body_nodes: HashMap::default(),
++        body_skip: None,
      };
      c.execute()
  }
-@@ -87,7 +95,30 @@
+@@ -87,7 +99,86 @@
      compile_lark(builder, parsed)
  }
  
@@ -83,10 +87,66 @@
 +}
 +
  impl Compiler {
++    // A quoted terminal cannot remain one greedy lexeme: PATH followed by a
++    // newline shares a '\\' prefix with an escaped backslash inside PATH.
++    // Lower the terminal's DFA to grammar rules and quote individual byte
++    // transitions. Complete JSON escape sequences are then atomic lexemes.
++    fn body_node(&mut self, rx: RegexId) -> Result<NodeRef> {
++        if let Some(node) = self.body_nodes.get(&rx) {
++            return Ok(*node);
++        }
++        let mut dfa = self.builder.regex.spec.regex_builder.to_regex_limited(rx, 1_000_000)?;
++        let initial = dfa.initial_state();
++        let root = self.builder.new_node("quoted_terminal");
++        let mut nodes = HashMap::default();
++        nodes.insert(initial, root);
++        let mut pending = vec![initial];
++        while let Some(state) = pending.pop() {
++            self.builder.check_limits()?;
++            let mut transitions: HashMap<NodeRef, Vec<u32>> = HashMap::default();
++            for byte in 0u16..=255 {
++                let next = dfa.transition(state, byte as u8);
++                ensure!(dfa.cost() <= 1_000_000, "tool input terminal DFA exceeds compilation budget");
++                if next.is_dead() {
++                    continue;
++                }
++                let target = *nodes.entry(next).or_insert_with(|| {
++                    pending.push(next);
++                    self.builder.new_node("quoted_state")
++                });
++                let set = transitions.entry(target).or_insert_with(|| vec![0; 8]);
++                set[byte as usize / 32] |= 1u32 << (byte % 32);
++            }
++            let mut options = vec![];
++            if dfa.is_accepting(state) {
++                options.push(self.builder.empty());
++            }
++            for (target, mut bytes) in transitions {
++                let mut encoded = vec![];
++                // Quote special bytes individually. This also avoids the upstream
++                // JsonQuote control-class shortcut admitting quotes not in a class.
++                for byte in (0u8..32).chain([b'"', b'\\', 127]) {
++                    let mask = 1u32 << (byte % 32);
++                    if bytes[byte as usize / 32] & mask != 0 {
++                        bytes[byte as usize / 32] &= !mask;
++                        encoded.push(self.builder.regex.add_ast(RegexAst::JsonQuote(
++                            Box::new(RegexAst::Byte(byte)), JsonQuoteOptions::with_unicode_raw()))?);
++                    }
++                }
++                encoded.push(self.builder.regex.add_ast(RegexAst::ByteSet(bytes))?);
++                let encoded = self.builder.regex.select(encoded);
++                let byte = self.builder.lexeme(encoded);
++                options.push(self.builder.join(&[byte, target]));
++            }
++            let choices = self.builder.select(&options);
++            self.builder.set_placeholder(nodes[&state], choices);
++        }
++        self.body_nodes.insert(rx, root);
++        Ok(root)
++    }
++
 +    fn body_regex(&mut self, rx: RegexId) -> Result<RegexId> {
 +        match self.tool_input_mode.as_deref() {
-+            Some("json_string") => self.builder.regex.add_ast(RegexAst::JsonQuote(
-+                Box::new(RegexAst::ExprRef(rx)), JsonQuoteOptions::with_unicode_raw())),
 +            Some("raw_no_lt") => {
 +                // Reject, rather than silently narrow, a grammar that can close an XML tag.
 +                let bad = self.builder.regex.add_ast(RegexAst::And(vec![
@@ -102,7 +162,7 @@
      fn do_token(&mut self, name: &str) -> Result<RegexId> {
          if let Some(id) = self.regex_ids.get(name) {
              return Ok(*id);
-@@ -123,6 +154,7 @@
+@@ -123,6 +214,7 @@
                  Ok(self.builder.regex.optional(id))
              }
              Atom::Not(inner) => {
@@ -110,7 +170,7 @@
                  let id = self.do_token_atom(*inner)?;
                  Ok(self.builder.regex.not(id))
              }
-@@ -171,7 +203,10 @@
+@@ -171,7 +263,10 @@
                      };
                      self.mk_regex("regex", rx)
                  }
@@ -122,15 +182,22 @@
                  Value::SpecialToken(s) => {
                      bail!("special tokens (like {:?}) cannot be used in terminals", s);
                  }
-@@ -259,6 +294,7 @@
+@@ -259,6 +354,14 @@
      }
  
      fn lift_regex(&mut self, rx_id: RegexId) -> Result<NodeRef> {
++        if self.tool_input_mode.as_deref() == Some("json_string") {
++            let node = self.body_node(rx_id)?;
++            return Ok(match self.body_skip {
++                Some(skip) => self.builder.join(&[skip, node]),
++                None => node,
++            });
++        }
 +        let rx_id = self.body_regex(rx_id)?;
          Ok(self.builder.lexeme(rx_id))
      }
  
-@@ -299,6 +335,11 @@
+@@ -299,6 +402,11 @@
                  Ok(self.lift_regex(rx)?)
              }
              Atom::Value(value) => {
@@ -142,7 +209,7 @@
                  match &value {
                      Value::Name(n) => {
                          if self.is_rule(n) {
-@@ -483,6 +524,10 @@
+@@ -483,6 +591,10 @@
              .remove(name)
              .ok_or_else(|| anyhow!("rule {:?} not found", name))?;
  
@@ -153,7 +220,7 @@
          self.in_progress
              .insert(name.to_string(), rule.is_parametric);
  
-@@ -622,9 +667,14 @@
+@@ -622,13 +734,33 @@
              serde_json::from_value(self.grammar.llguidance_options.clone())
                  .map_err(|e| anyhow!("failed to parse %llguidance declaration: {}", e))?;
  
@@ -164,11 +231,32 @@
 -            .map(|exp| Ok(RegexAst::ExprRef(self.do_token_expansions(exp)?)))
 +            .map(|exp| {
 +                let rx = self.do_token_expansions(exp)?;
-+                Ok(RegexAst::ExprRef(self.body_regex(rx)?))
++                Ok(rx)
 +            })
              .collect::<Result<Vec<_>>>()?;
-         let id = self.builder.add_grammar(opts, RegexAst::Or(ignore))?;
+-        let id = self.builder.add_grammar(opts, RegexAst::Or(ignore))?;
+-
++        let json_body = self.tool_input_mode.as_deref() == Some("json_string");
++        let mut lexer_ignore = vec![];
++        if !json_body {
++            for rx in &ignore {
++                lexer_ignore.push(RegexAst::ExprRef(self.body_regex(*rx)?));
++            }
++        }
++        let id = self.builder.add_grammar(opts, RegexAst::Or(lexer_ignore))?;
++        if json_body && !ignore.is_empty() {
++            let rx = self.builder.regex.select(ignore);
++            let node = self.body_node(rx)?;
++            self.body_skip = Some(self.builder.repeat(node, 0, None));
++        }
+         let start = self.do_rule(start_name, None)?;
++        let start = match self.body_skip {
++            Some(skip) => self.builder.join(&[skip, start, skip]),
++            None => start,
++        };
+         self.builder.set_start_node(start);
  
+         let mut builder = self.builder;
 --- a/parser/src/lark/mod.rs
 +++ b/parser/src/lark/mod.rs
 @@ -4,4 +4,4 @@
