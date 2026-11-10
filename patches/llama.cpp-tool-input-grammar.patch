@@ -36,7 +36,7 @@
 @@ -0,0 +1,147 @@
 +#include "chat-peg-parser.h"
 +#include "json-schema-to-grammar.h"
-+#include "llama-grammar.h"
++#include "../src/llama-grammar.h"
 +
 +#include <cstdio>
 +#include <set>
@@ -179,7 +179,7 @@
 +        lark += "start: " + root + "\n";
 +    }
 +    grammars[0] = {{"name", "native"}, {"lark_grammar", lark}};
-+    data.grammar = "%llguidance-json\n" + json{{"grammars", grammars}}.dump();
++    data.grammar = "%llguidance-json\n" + json{{"grammars", grammars}, {"native_tokens", data.preserved_tokens}}.dump();
 +}
 --- a/common/chat.cpp
 +++ b/common/chat.cpp
@@ -240,7 +240,7 @@
  
      // withheld from the system prompt, a tool_reference reveals it later in the conversation
      bool defer_loading = false;
-+    std::string input_grammar; // LLGuidance Lark for the decoded input string
++    std::string input_grammar = {}; // LLGuidance Lark for the decoded input string
  };
  
  enum common_chat_tool_choice {
@@ -279,7 +279,17 @@
          UPDATE_COMMAND ""
 --- a/common/llguidance.cpp
 +++ b/common/llguidance.cpp
-@@ -39,7 +39,9 @@
+@@ -1,5 +1,9 @@
+ #include "sampling.h"
+ #include "log.h"
++#include "json.h"
++
++#include <cstring>
++#include <set>
+ 
+ #ifdef LLAMA_USE_LLGUIDANCE
+ 
+@@ -39,7 +43,9 @@
  static void llama_sampler_llg_accept_impl(llama_sampler * smpl, llama_token token) {
      auto * ctx = (llama_sampler_llg *) smpl->ctx;
      if (ctx->grammar) {
@@ -290,7 +300,7 @@
      }
  }
  
-@@ -51,13 +53,13 @@
+@@ -51,13 +57,13 @@
              if (llg_matcher_compute_mask(ctx->grammar) == 0) {
                  mask = llg_matcher_get_mask(ctx->grammar);
              } else {
@@ -311,10 +321,63 @@
          for (size_t i = 0; i < cur_p->size; ++i) {
              auto token = cur_p->data[i].id;
              if ((mask[token / 32] & (1 << (token % 32))) == 0) {
-@@ -224,6 +226,10 @@
+@@ -136,12 +142,14 @@
+     return r;
+ }
+ 
+-static LlgTokenizer * llama_sampler_llg_new_tokenizer(const llama_vocab * vocab) {
++static LlgTokenizer * llama_sampler_llg_new_tokenizer(const llama_vocab * vocab,
++                                                      const std::set<std::string> & native_tokens) {
+     // TODO store the tokenizer in the vocab somehow
+     static const llama_vocab * vocab_cache;
+     static LlgTokenizer *      tokenizer_cache;
+-
+-    if (vocab_cache == vocab) {
++    static std::set<std::string> native_tokens_cache;
++
++    if (vocab_cache == vocab && native_tokens_cache == native_tokens) {
+         return llg_clone_tokenizer(tokenizer_cache);
+     }
+ 
+@@ -176,8 +184,13 @@
+                 GGML_ABORT("llama_detokenize failed\n");
+             }
+             if (size != 0) {
+-                *dp = '\xff';  // special token prefix marker
+-                size += 1;
++                if (!llama_vocab_is_eog(vocab, token) && native_tokens.count(std::string(dp + 1, size))) {
++                    // Native tool syntax is matched as the same visible text used by the response parser.
++                    memmove(dp, dp + 1, size);
++                } else {
++                    *dp = '\xff';  // special token prefix marker
++                    size += 1;
++                }
+             }
+         }
+ 
+@@ -214,16 +227,28 @@
+     }
+     vocab_cache     = vocab;
+     tokenizer_cache = tokenizer;
++    native_tokens_cache = native_tokens;
+ 
+     return llg_clone_tokenizer(tokenizer_cache);
+ }
+ 
+ llama_sampler * llama_sampler_init_llg(const llama_vocab * vocab, const char * grammar_kind,
+                                        const char * grammar_data) {
++    std::set<std::string> native_tokens;
++    if (grammar_kind && std::string(grammar_kind) == "llguidance") {
++        auto data = common_json::parse(grammar_data);
++        if (data.contains("native_tokens")) {
++            native_tokens = data.at("native_tokens").get<std::set<std::string>>();
++        }
++    }
+     auto * ctx = new llama_sampler_llg;
  
      if (grammar_kind != nullptr && grammar_kind[0] != '\0') {
-         auto tokenizer = llama_sampler_llg_new_tokenizer(vocab);
+-        auto tokenizer = llama_sampler_llg_new_tokenizer(vocab);
++        auto tokenizer = llama_sampler_llg_new_tokenizer(vocab, native_tokens);
 +        if (!tokenizer) {
 +            delete ctx;
 +            throw std::runtime_error("llguidance tokenizer initialization failed");
@@ -322,7 +385,7 @@
          *ctx           = {
              /* .vocab        = */ vocab,
              /* .grammar_kind = */ grammar_kind,
-@@ -231,6 +237,11 @@
+@@ -231,6 +256,11 @@
              /* .tokenizer    = */ tokenizer,
              /* .grammar      = */ llama_sampler_llg_new(tokenizer, grammar_kind, grammar_data),
          };
@@ -378,8 +441,8 @@
  struct common_peg_gbnf_parser {
      common_peg_parser_id child;
      std::string grammar;
-+    std::string input_grammar;
-+    std::string tool_name;
++    std::string input_grammar = {};
++    std::string tool_name = {};
 +    bool input_json = false;
  };
  
