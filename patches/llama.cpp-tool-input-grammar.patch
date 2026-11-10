@@ -33,7 +33,7 @@
      common_peg_parser permute(const std::string & rule_prefix, const std::vector<common_peg_parser> & parsers);
 --- /dev/null
 +++ b/common/chat-tool-grammar.cpp
-@@ -0,0 +1,153 @@
+@@ -0,0 +1,155 @@
 +#include "chat-peg-parser.h"
 +#include "json-schema-to-grammar.h"
 +#include "../src/llama-grammar.h"
@@ -185,7 +185,9 @@
 +        lark += "start: " + root + "\n";
 +    }
 +    grammars[0] = {{"name", "native"}, {"lark_grammar", lark}};
-+    data.grammar = "%llguidance-json\n" + json{{"grammars", grammars}, {"native_tokens", data.preserved_tokens}}.dump();
++    auto native_markers = data.preserved_tokens;
++    native_markers.push_back(data.generation_prompt);
++    data.grammar = "%llguidance-json\n" + json{{"grammars", grammars}, {"native_tokens", native_markers}}.dump();
 +}
 --- a/common/chat.cpp
 +++ b/common/chat.cpp
@@ -372,7 +374,7 @@
              }
          }
  
-@@ -214,16 +227,28 @@
+@@ -214,16 +227,34 @@
      }
      vocab_cache     = vocab;
      tokenizer_cache = tokenizer;
@@ -387,7 +389,13 @@
 +    if (grammar_kind && std::string(grammar_kind) == "llguidance") {
 +        auto data = common_json::parse(grammar_data);
 +        if (data.contains("native_tokens")) {
-+            native_tokens = data.at("native_tokens").get<std::set<std::string>>();
++            for (const auto & marker : data.at("native_tokens").get<std::vector<std::string>>()) {
++                for (auto token : common_tokenize(vocab, marker, false, true)) {
++                    if (common_token_to_piece(vocab, token, false).empty() && !llama_vocab_is_eog(vocab, token)) {
++                        native_tokens.insert(common_token_to_piece(vocab, token, true));
++                    }
++                }
++            }
 +        }
 +    }
      auto * ctx = new llama_sampler_llg;
@@ -402,7 +410,7 @@
          *ctx           = {
              /* .vocab        = */ vocab,
              /* .grammar_kind = */ grammar_kind,
-@@ -231,6 +256,11 @@
+@@ -231,6 +262,11 @@
              /* .tokenizer    = */ tokenizer,
              /* .grammar      = */ llama_sampler_llg_new(tokenizer, grammar_kind, grammar_data),
          };
@@ -516,7 +524,7 @@
 +endif()
 --- /dev/null
 +++ b/tests/test-tool-input-grammar.cpp
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,217 @@
 +#ifdef NDEBUG
 +#undef NDEBUG
 +#endif
@@ -590,7 +598,7 @@
 +    return {{"type", "function"}, {"function", function}};
 +}
 +
-+static common_chat_params apply(const std::string & file, const json & tools, bool required, bool parallel) {
++static common_chat_params apply(const std::string & file, const json & tools, bool required, bool parallel, bool none = false) {
 +    std::ifstream stream("models/templates/" + file);
 +    assert(stream.good());
 +    std::stringstream text;
@@ -603,7 +611,8 @@
 +    inputs.messages = {msg};
 +    inputs.tools = common_chat_tools_parse_oaicompat(tools);
 +    inputs.enable_thinking = false;
-+    inputs.tool_choice = required ? COMMON_CHAT_TOOL_CHOICE_REQUIRED : COMMON_CHAT_TOOL_CHOICE_AUTO;
++    inputs.tool_choice = none ? COMMON_CHAT_TOOL_CHOICE_NONE :
++        (required ? COMMON_CHAT_TOOL_CHOICE_REQUIRED : COMMON_CHAT_TOOL_CHOICE_AUTO);
 +    inputs.parallel_tool_calls = parallel;
 +    return common_chat_templates_apply(tmpl.get(), inputs);
 +}
@@ -698,6 +707,12 @@
 +    auto bad_call = call;
 +    bad_call.replace(bad_call.find("(1+(2+3))"), 9, "(1*2)");
 +    check(p, bad_call, false);
++    auto wrong_body = call;
++    wrong_body.replace(wrong_body.find("calculate"), std::string("calculate").size(), "apply_patch");
++    check(p, wrong_body, false);
++    auto wrong_schema = read;
++    wrong_schema.replace(wrong_schema.find("\"README.md\""), std::string("\"README.md\"").size(), "42");
++    check(p, wrong_schema, false);
 +    auto calls = parse(p, read + "\n" + patch_call + "\n" + call).tool_calls;
 +    assert(calls.size() == 3);
 +    assert(json::parse(calls[1].arguments).at("input") == patch_text);
@@ -721,6 +736,9 @@
 +    auto ordinary = apply("Qwen-Qwen2.5-7B-Instruct.jinja", json::array({tool("read_file")}), false, true);
 +    assert(ordinary.grammar.find("%llguidance-json") == std::string::npos);
 +    assert(parse(ordinary, read).tool_calls.size() == 1);
++    auto disabled = apply("Qwen-Qwen2.5-7B-Instruct.jinja", tools, false, true, true);
++    assert(disabled.grammar.empty());
++    assert(parse(disabled, "Hello").tool_calls.empty());
 +    llg_free_tokenizer(tokenizer);
 +    std::cout << "Native tool input grammar tests passed (no model loaded).\n";
 +}
