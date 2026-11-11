@@ -41,35 +41,106 @@ index 8e3c88d..e173276 100644
      set_target_properties(llguidance PROPERTIES IMPORTED_LOCATION ${LLGUIDANCE_PATH}/${LLGUIDANCE_LIB_NAME})
      add_dependencies(llguidance llguidance_ext)
  
+diff --git a/common/chat-auto-parser-generator.cpp b/common/chat-auto-parser-generator.cpp
+index 9b918b3..9d6b315 100644
+--- a/common/chat-auto-parser-generator.cpp
++++ b/common/chat-auto-parser-generator.cpp
+@@ -130,7 +130,52 @@ common_peg_arena autoparser::build_parser(const generation_params & inputs, cons
+             parser = content.build_parser(ctx);
+         }
+         const std::string reasoning_start = trim_whitespace(reasoning.start);
+-        return pure_content ? p.prefix(generation_prompt, reasoning_start) + parser : p.prefix(generation_prompt, reasoning_start) << parser;
++        auto header = p.prefix(generation_prompt, reasoning_start);
++        if (has_tools && !has_response_format) {
++            auto tool_start = !tools.format.section_start.empty() ? tools.format.section_start : tools.format.per_call_start;
++            if (tool_start.empty() && tools.format.mode == tool_format::JSON_NATIVE) { tool_start = "{"; }
++            if (!tool_start.empty()) {
++                const bool wrapped_content = tools.format.mode == tool_format::JSON_NATIVE && content.is_always_wrapped();
++                auto content_state = p.prefix_state(!wrapped_content, true);
++                p.prefix_tool(content_state, p.literal(tool_start));
++                auto after_reasoning = content_state;
++                if (wrapped_content && !content.end.empty()) {
++                    auto wrapped = p.prefix_state(true, false);
++                    p.prefix_edge(wrapped, p.literal(content.end), content_state);
++                    if (content.start.empty()) { after_reasoning = wrapped; }
++                    else {
++                        after_reasoning = p.prefix_state(false, false, content_state);
++                        p.prefix_edge(after_reasoning, p.literal(content.start), wrapped);
++                    }
++                }
++                auto first_state = after_reasoning;
++                if (ctx.extracting_reasoning && !reasoning.end.empty()) {
++                    auto after_close = after_reasoning;
++                    const auto last_nonspace = reasoning.end.find_last_not_of(" \t\r\n\f\v");
++                    for (size_t i = reasoning.end.size(); i > last_nonspace + 1; --i) {
++                        auto optional_space = p.prefix_state(false, false, after_close);
++                        p.prefix_edge(optional_space, p.literal(reasoning.end.substr(i - 1, 1)), after_close);
++                        after_close = optional_space;
++                    }
++                    auto thought_state = p.prefix_state(true, false);
++                    p.prefix_edge(thought_state, p.literal(trim_whitespace(reasoning.end)), after_close);
++                    if (reasoning_start.empty()) { first_state = thought_state; }
++                    else {
++                        first_state = p.prefix_state(false, false, after_reasoning);
++                        p.prefix_edge(first_state, p.optspace(reasoning.start), thought_state);
++                    }
++                }
++                if (!pure_content) {
++                    auto whitespace_state = p.prefix_state(false, false, first_state);
++                    p.prefix_whitespace(whitespace_state);
++                    first_state = whitespace_state;
++                }
++                auto header_state = p.prefix_state(false, false);
++                p.prefix_edge(header_state, header, first_state);
++                p.prefix_root(header_state);
++            }
++        }
++        return pure_content ? header + parser : header << parser;
+     });
+ }
+ 
+@@ -408,6 +453,7 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
+             args_seq = args_seq + p.repeat(p.space() + any_opt, 0, -1);
+         }
+ 
++        args_seq = p.semantic(args_seq, common_chat_peg_builder::TOOL_ARGS);
+         if (!arguments.start.empty()) {
+             args_seq = p.literal(arguments.start) + args_seq;
+         }
 diff --git a/common/chat-peg-parser.h b/common/chat-peg-parser.h
-index 114fa04..649c45d 100644
+index 114fa04..2cc3bbc 100644
 --- a/common/chat-peg-parser.h
 +++ b/common/chat-peg-parser.h
-@@ -52,6 +52,11 @@ class common_chat_peg_minimax_m3_mapper : public common_chat_peg_mapper {
+@@ -52,6 +52,9 @@ class common_chat_peg_minimax_m3_mapper : public common_chat_peg_mapper {
      void visit(const common_peg_ast_arena & arena, common_peg_ast_id id);
  };
  
-+common_chat_params common_chat_apply_runtime_format(const common_chat_template & tmpl,
-+    const autoparser::generation_params & params, const common_chat_templates_inputs & inputs);
-+common_chat_msg common_chat_runtime_map(const common_peg_ast_arena & arena,
-+    const common_peg_parse_result & result);
++void common_chat_apply_tool_grammars(common_chat_params & data,
++    const common_chat_templates_inputs & inputs);
 +
  struct content_structure;
  struct tool_call_structure;
  
 diff --git a/common/chat-tool-grammar.cpp b/common/chat-tool-grammar.cpp
 new file mode 100644
-index 0000000..cedb14d
+index 0000000..8cd74ed
 --- /dev/null
 +++ b/common/chat-tool-grammar.cpp
-@@ -0,0 +1,334 @@
+@@ -0,0 +1,790 @@
 +#include "chat-peg-parser.h"
 +#include "chat-auto-parser.h"
 +#include "parsers/parsers.h"
 +#include "json-schema-to-grammar.h"
 +#include "../src/llama-grammar.h"
++#include "../src/unicode.h"
 +#include <cstdio>
 +#include <set>
++#include <tuple>
++#include <cctype>
++#include <algorithm>
++#ifdef LLAMA_USE_LLGUIDANCE
++#include "llguidance.h"
++#endif
 +
 +using json = common_json;
 +
@@ -125,280 +196,729 @@ index 0000000..cedb14d
 +    return result;
 +}
 +
-+namespace {
-+// The descriptor is data, never executable source. The same tree supplies the
-+// response parser and the outer constraint; only body/schema leaves use LLG.
-+struct format_compiler {
-+    common_chat_peg_builder & p;
-+    const common_chat_templates_inputs & inputs;
-+    const json & spec;
-+    const std::string & prefill;
++// Only the sampling graph is rewritten. Output keeps the native parser and mapper.
++struct common_chat_tool_grammar {
++    using id = common_peg_parser_id;
++    struct context {
++        std::string tool;
++        std::string argument;
++        std::vector<std::string> forbidden_prefixes;
++    };
++    struct result { id node; bool changed; };
++
++    const common_peg_arena & source;
++    common_peg_arena output;
++    std::map<std::string, std::string> bodies;
++    std::map<std::string, json> parameters;
 +    std::map<std::string, json> external;
 +    std::set<std::string> bound;
-+    const common_chat_tool * tool = nullptr;
-+    json property;
-+    std::string property_name;
-+    size_t nodes = 0;
++    std::set<std::string> validated_tools;
++    std::vector<std::string> encoding_errors;
++    std::map<std::tuple<id, std::string, std::string, std::vector<std::string>>, result> cache;
++    size_t visits = 0;
++    bool allow_plain;
++    bool parallel;
++#ifdef LLAMA_USE_LLGUIDANCE
++    LlgTokenizer * byte_tokenizer = nullptr;
++#endif
 +
-+    format_compiler(common_chat_peg_builder & builder, const common_chat_templates_inputs & request,
-+                    const json & descriptor, const std::string & prefix)
-+        : p(builder), inputs(request), spec(descriptor), prefill(prefix) {}
-+
-+    void require(bool ok, const std::string & message) {
-+        if (!ok) { throw std::invalid_argument("native_tool_format: " + message); }
-+    }
-+
-+    common_peg_parser leaf(const common_peg_parser & parser, json grammar) {
-+        const std::string name = "external-" + std::to_string(external.size());
-+        external.emplace(name, std::move(grammar));
-+        return p.rule(name, p.gbnf(parser, "\"\""));
-+    }
-+
-+    common_peg_parser emit(const std::string & text) {
-+        return p.tag("runtime-emit:" + text, p.eps());
-+    }
-+
-+    common_peg_parser raw_string(const std::string & stop) {
-+        // until() can return SUCCESS while withholding a partial delimiter.
-+        // Confirm the full delimiter without consuming it before closing the
-+        // JSON string. A possible delimiter prefix must remain a partial value.
-+        return p.tag("runtime-string", p.until(stop) + p.peek(p.literal(stop)));
-+    }
-+
-+    common_peg_parser value(const json & schema, const std::string & encoding, const std::string & stop) {
-+        if (encoding == "json") {
-+            return leaf(p.tag("runtime-json", p.json()), {{"json_schema", schema}});
-+        }
-+        require(encoding == "raw" && !stop.empty(), "raw values require a closing delimiter");
-+        return leaf(raw_string(stop),
-+            {{"json_schema", schema}, {"tool_input_mode", "raw"}, {"tool_input_stop", stop}});
-+    }
-+
-+    bool condition(const std::string & name) {
-+        if (name == "required") { return inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED; }
-+        if (name == "parallel") { return inputs.parallel_tool_calls; }
-+        if (name == "thinking") { return inputs.enable_thinking; }
-+        if (name == "thinking_prefilled") {
-+            const auto start = spec.value("thinking_start", "");
-+            return inputs.enable_thinking && !start.empty() && prefill.find(start) != std::string::npos;
-+        }
-+        if (name == "tools") { return !inputs.tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE; }
-+        if (name == "input_grammar") { require(tool, "input_grammar condition outside tools"); return !tool->input_grammar.empty(); }
-+        if (name == "string") { require(!property.is_null(), "string condition outside parameters"); return property.value("type", "") == "string"; }
-+        throw std::invalid_argument("native_tool_format: unknown condition " + name);
-+    }
-+
-+    common_peg_parser compile(const json & node, size_t depth = 0) {
-+        require(depth < 64 && ++nodes <= 10000, "descriptor expansion exceeds budget");
-+        if (node.is_string()) { return p.literal(node.get<std::string>()); }
-+        if (node.is_array()) {
-+            std::vector<common_peg_parser> parts;
-+            for (const auto & child : node) { parts.push_back(compile(child, depth + 1)); }
-+            return p.sequence(parts);
-+        }
-+        require(node.is_object(), "a node must be a literal, sequence or operation");
-+        const auto op = node.at("op").get<std::string>();
-+        auto child = [&]() { return compile(node.at("item"), depth + 1); };
-+        if (op == "ref") { return compile(spec.at("definitions").at(node.at("name").get<std::string>()), depth + 1); }
-+        if (op == "if") { return compile(node.at(condition(node.at("condition")) ? "then" : "else"), depth + 1); }
-+        if (op == "choice") {
-+            std::vector<common_peg_parser> alternatives;
-+            for (const auto & item : node.at("items")) { alternatives.push_back(compile(item, depth + 1)); }
-+            require(!alternatives.empty(), "empty choice");
-+            return p.choice(alternatives);
-+        }
-+        if (op == "repeat") {
-+            const int min = node.value("min", 0), max = node.value("max", -1);
-+            require(min >= 0 && min <= 100 && (max == -1 || (max >= min && max <= 100)), "invalid repetition");
-+            return p.repeat(child(), min, max);
-+        }
-+        if (op == "space") { return p.space(); }
-+        if (op == "until") {
-+            const auto stops = node.at("stops").get<std::vector<std::string>>();
-+            for (const auto & stop : stops) { require(!stop.empty(), "empty delimiter"); }
-+            return p.until_one_of(stops);
-+        }
-+        if (op == "content" || op == "reasoning") { return p.tag(op, child()); }
-+        if (op == "emit") { return emit(node.at("value")); }
-+        if (op == "tools") {
-+            require(!tool, "nested tools expansion");
-+            require(!inputs.tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE, "tools disabled");
-+            std::vector<common_peg_parser> alternatives;
-+            for (const auto & entry : inputs.tools) {
-+                tool = &entry;
-+                alternatives.push_back(p.tag("runtime-tool", p.eps()) + child());
++    common_chat_tool_grammar(const common_peg_arena & parser, const common_chat_templates_inputs & inputs)
++        : source(parser), output(parser), allow_plain(inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO), parallel(inputs.parallel_tool_calls) {
++        for (const auto & tool : inputs.tools) {
++            if (tool.name.empty() || tool.name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-") != std::string::npos) {
++                throw std::invalid_argument("input_grammar: tool names must use ASCII letters, digits, underscore, dot or dash");
 +            }
-+            tool = nullptr;
-+            return p.choice(alternatives);
++            auto schema = common_chat_tool_parameters(json{{"parameters", json::parse(tool.parameters)}});
++            auto document = common_chat_schema_from_json(schema);
++            if (!document.root->value_types().is_only(common_chat_schema::TYPE_OBJECT)) {
++                throw std::invalid_argument("input_grammar: function parameters must describe an object");
++            }
++            if (!parameters.emplace(tool.name, std::move(schema)).second) {
++                throw std::invalid_argument("input_grammar: duplicate tool name");
++            }
++            if (!tool.input_grammar.empty() && !bodies.emplace(tool.name, tool.input_grammar).second) {
++                throw std::invalid_argument("input_grammar: duplicate tool name");
++            }
 +        }
-+        if (op == "name") {
-+            require(tool, "name outside tools");
-+            const auto suffix = node.at("suffix").get<std::string>();
-+            require(!suffix.empty(), "name requires an atomic closing suffix");
-+            // Delay names until their boundary is known: foo and foobar must
-+            // never emit incompatible streaming name deltas for prefix foo.
-+            return p.atomic(p.tag("runtime-name", p.literal(tool->name)) + p.literal(suffix));
++    }
++    ~common_chat_tool_grammar() {
++#ifdef LLAMA_USE_LLGUIDANCE
++        if (byte_tokenizer) { llg_free_tokenizer(byte_tokenizer); }
++#endif
++    }
++
++    static std::vector<id> children(const common_peg_parser_variant & node) {
++        return std::visit([](const auto & p) -> std::vector<id> {
++            using T = std::decay_t<decltype(p)>;
++            if constexpr (std::is_same_v<T, common_peg_sequence_parser> || std::is_same_v<T, common_peg_choice_parser>) {
++                return p.children;
++            } else if constexpr (std::is_same_v<T, common_peg_repetition_parser> ||
++                std::is_same_v<T, common_peg_and_parser> || std::is_same_v<T, common_peg_not_parser> ||
++                std::is_same_v<T, common_peg_schema_parser> || std::is_same_v<T, common_peg_rule_parser> ||
++                std::is_same_v<T, common_peg_atomic_parser> || std::is_same_v<T, common_peg_tag_parser> ||
++                std::is_same_v<T, common_peg_gbnf_parser> || std::is_same_v<T, common_peg_ac_parser>) {
++                return {p.child};
++            }
++            return {};
++        }, node);
++    }
++
++    std::vector<id> descendants(id root) const {
++        std::vector<id> stack{root}, nodes;
++        std::set<id> seen;
++        while (!stack.empty()) {
++            auto next = stack.back(); stack.pop_back();
++            if (!seen.insert(next).second) { continue; }
++            nodes.push_back(next);
++            auto child = children(source.get(next));
++            stack.insert(stack.end(), child.begin(), child.end());
++            if (auto ref = std::get_if<common_peg_ref_parser>(&source.get(next))) { stack.push_back(source.get_rule(ref->name)); }
 +        }
-+        if (op == "args") {
-+            require(tool, "args outside tools");
-+            bound.insert(tool->name);
-+            if (tool->input_grammar.empty()) { return value(json::parse(tool->parameters), "json", ""); }
-+            auto body = leaf(p.string_content('"'), {{"lark_grammar", tool->input_grammar}, {"tool_input_mode", "json_string"}});
-+            return p.tag("runtime-json", p.literal("{\"input\":\"") + body + p.literal("\"}"));
++        return nodes;
++    }
++
++    std::string literal(id node, size_t depth = 0) const {
++        if (depth > 64) { return {}; }
++        return std::visit([&](const auto & p) -> std::string {
++            using T = std::decay_t<decltype(p)>;
++            if constexpr (std::is_same_v<T, common_peg_literal_parser>) { return p.literal; }
++            else if constexpr (std::is_same_v<T, common_peg_tag_parser> || std::is_same_v<T, common_peg_atomic_parser> ||
++                std::is_same_v<T, common_peg_rule_parser>) { return literal(p.child, depth + 1); }
++            return {};
++        }, source.get(node));
++    }
++
++    std::set<std::string> names(id root, const char * tag) const {
++        std::set<std::string> values;
++        for (auto node : descendants(root)) {
++            auto value = std::get_if<common_peg_tag_parser>(&source.get(node));
++            if (value && value->tag == tag) {
++                auto name = literal(value->child);
++                if (name.empty()) { throw std::invalid_argument("input_grammar: native name is not a fixed literal"); }
++                values.insert(name);
++            }
 +        }
-+        if (op == "input") {
-+            require(tool && !tool->input_grammar.empty(), "input needs an input_grammar tool");
-+            bound.insert(tool->name);
-+            const auto stop = node.at("stop").get<std::string>();
-+            require(!stop.empty(), "input needs a closing delimiter");
-+            return leaf(raw_string(stop),
-+                {{"lark_grammar", tool->input_grammar}, {"tool_input_mode", "raw"}, {"tool_input_stop", stop}});
++        return values;
++    }
++
++    id rule(const std::string & name, const std::string & grammar, id original) {
++        auto value = output.add_parser(common_peg_gbnf_parser{original, grammar});
++        auto node = output.add_parser(common_peg_rule_parser{name, value, false});
++        output.add_rule(name, node);
++        return node;
++    }
++
++    std::string external_rule(json definition) {
++        auto name = "native-body-" + std::to_string(external.size());
++        external.emplace(name, std::move(definition));
++        // Keep external bodies opaque while deriving a native trigger's continuation.
++        rule(name, "[\\U0010fffd]", output.add_parser(common_peg_epsilon_parser{}));
++        return name;
++    }
++
++    bool raw_encoding_is_lossless(const json & definition, const context & ctx) {
++#ifdef LLAMA_USE_LLGUIDANCE
++        if (!byte_tokenizer) {
++            std::vector<uint32_t> lengths(257, 1);
++            std::vector<uint8_t> bytes;
++            for (int c = 0; c < 256; ++c) { bytes.push_back(c); }
++            lengths[256] = 4;
++            bytes.insert(bytes.end(), {255, 'E', 'O', 'S'});
++            LlgTokenizerInit ti = {};
++            ti.vocab_size = 257; ti.tok_eos = 256;
++            ti.token_lens = lengths.data(); ti.token_bytes = bytes.data();
++            ti.use_approximate_greedy_tokenize_fn = true;
++            char error[2048];
++            byte_tokenizer = llg_new_tokenizer(&ti, error, sizeof(error));
++            if (!byte_tokenizer) { throw std::invalid_argument(error); }
 +        }
-+        if (op == "parameters") {
-+            require(tool && tool->input_grammar.empty() && property.is_null(), "parameters needs ordinary tool arguments");
-+            auto schema = json::parse(tool->parameters);
-+            require(schema.is_object() && schema.value("type", "") == "object" &&
-+                    schema.contains("properties") && schema.at("properties").is_object() &&
-+                    schema.contains("additionalProperties") && schema.at("additionalProperties") == false,
-+                    "parameters requires a closed object schema; use args for general JSON Schema");
-+            static const std::set<std::string> allowed = {"type", "properties", "required", "additionalProperties", "title", "description"};
-+            for (const auto & item : schema.items()) { require(allowed.count(item.key()), "unsupported object constraint in parameters: " + item.key()); }
++        LlgConstraintInit init;
++        llg_constraint_init_set_defaults(&init, byte_tokenizer);
++        const auto json_grammar = json{{"grammars", json::array({definition})}}.dump();
++        std::unique_ptr<LlgMatcher, decltype(&llg_free_matcher)> matcher(
++            llg_new_matcher(&init, "llguidance", json_grammar.c_str()), llg_free_matcher);
++        if (!matcher) { throw std::runtime_error("input_grammar: compiler allocation failed"); }
++        if (const auto * error = llg_matcher_get_error(matcher.get())) {
++            encoding_errors.push_back(ctx.tool + ": " + error);
++            return false;
++        }
++        for (const auto & prefix : ctx.forbidden_prefixes) {
++            std::unique_ptr<LlgMatcher, decltype(&llg_free_matcher)> check(llg_clone_matcher(matcher.get()), llg_free_matcher);
++            bool possible = true;
++            for (unsigned char byte : prefix) {
++                if (llg_matcher_compute_mask(check.get()) != 0) { throw std::invalid_argument(llg_matcher_get_error(check.get())); }
++                const auto * mask = llg_matcher_get_mask(check.get());
++                if (!(mask[byte / 32] & (1u << (byte % 32)))) { possible = false; break; }
++                if (llg_matcher_consume_token(check.get(), byte) != 0) { throw std::invalid_argument(llg_matcher_get_error(check.get())); }
++            }
++            if (possible) { encoding_errors.push_back(ctx.tool + ": body can start with a reserved native prefix"); return false; }
++        }
++        return true;
++#else
++        (void) definition; (void) ctx;
++        throw std::invalid_argument("input_grammar requires LLAMA_LLGUIDANCE=ON");
++#endif
++    }
++
++    id sequence(std::vector<id> nodes) {
++        for (auto node : nodes) { if (node == COMMON_PEG_INVALID_PARSER_ID) { return node; } }
++        return output.add_parser(common_peg_sequence_parser{std::move(nodes)});
++    }
++
++    void require_object(const json & schema) const {
++        static const std::set<std::string> supported = {"type", "properties", "required", "additionalProperties", "title", "description"};
++        if (!schema.is_object() || schema.value("type", "") != "object" ||
++            !schema.contains("properties") || !schema.at("properties").is_object()) {
++            throw std::invalid_argument("input_grammar: native object needs explicit properties");
++        }
++        for (const auto & item : schema.items()) {
++            if (!supported.count(item.key())) { throw std::invalid_argument("input_grammar: unsupported native object constraint " + item.key()); }
++        }
++        if (schema.contains("additionalProperties") && !schema.at("additionalProperties").is_boolean()) {
++            throw std::invalid_argument("input_grammar: native additional property schemas are unsupported");
++        }
++        for (const auto & name : schema.value("required", json::array())) {
++            if (!name.is_string() || !schema.at("properties").contains(name.get<std::string>())) {
++                throw std::invalid_argument("input_grammar: missing required native property");
++            }
++        }
++        for (const auto & property : schema.at("properties").items()) {
++            if (property.key().empty() || std::isspace(static_cast<unsigned char>(property.key().front())) ||
++                std::isspace(static_cast<unsigned char>(property.key().back()))) {
++                throw std::invalid_argument("input_grammar: native mapper cannot preserve surrounding whitespace in property names");
++            }
++        }
++    }
++
++    bool concatenated_arguments(id node, std::set<id> & seen) const {
++        if (!seen.insert(node).second) { return true; }
++        const auto & value = source.get(node);
++        if (auto tag = std::get_if<common_peg_tag_parser>(&value); tag && tag->tag == common_chat_peg_builder::TOOL_ARG) { return true; }
++        if (auto lit = std::get_if<common_peg_literal_parser>(&value)) { return lit->literal.empty(); }
++        if (std::holds_alternative<common_peg_epsilon_parser>(value) || std::holds_alternative<common_peg_space_parser>(value)) { return true; }
++        const auto child_nodes = children(value);
++        if (child_nodes.empty()) { return false; }
++        for (auto child : child_nodes) { if (!concatenated_arguments(child, seen)) { return false; } }
++        return true;
++    }
++
++    id native_value(const json & schema, context ctx, size_t depth = 0) {
++        if (depth > 64) { throw std::invalid_argument("input_grammar: native schema exceeds depth budget"); }
++        const auto type = schema.value("type", "");
++        if (type == "string") {
++            const auto & codec = source.value_codecs_.at("string");
++            auto stop = literal(codec.close);
++            if (stop.empty()) { throw std::invalid_argument("input_grammar: native string delimiter is not literal"); }
++            json definition;
++            if (bodies.count(ctx.tool) && ctx.argument == "input") { definition["lark_grammar"] = bodies.at(ctx.tool); }
++            else { definition["json_schema"] = schema; }
++            definition["tool_input_mode"] = "raw";
++            definition["tool_input_stop"] = stop;
++            if (!raw_encoding_is_lossless(definition, ctx)) { return COMMON_PEG_INVALID_PARSER_ID; }
++            auto body = output.get_rule(external_rule(std::move(definition)));
++            if (bodies.count(ctx.tool)) { bound.insert(ctx.tool); }
++            return sequence({codec.open, body, codec.close});
++        }
++        if (type == "object") {
++            require_object(schema);
++            const auto & codec = source.value_codecs_.at("object");
 +            std::set<std::string> required;
 +            for (const auto & name : schema.value("required", json::array())) { required.insert(name.get<std::string>()); }
-+            for (const auto & name : required) { require(schema.at("properties").contains(name), "required property missing from properties"); }
-+            bound.insert(tool->name);
-+            std::vector<common_peg_parser> parts;
++            for (const auto & name : required) {
++                if (!schema.at("properties").contains(name)) { throw std::invalid_argument("input_grammar: missing required native property"); }
++            }
++            std::vector<id> members;
 +            std::vector<bool> mandatory;
-+            for (const auto & item : schema.at("properties").items()) {
-+                property_name = item.key(); property = item.value();
-+                auto part = child();
-+                parts.push_back(part);
-+                mandatory.push_back(required.count(property_name) != 0);
++            for (const auto & property : schema.at("properties").items()) {
++                common_peg_parse_context key_input(property.key());
++                key_input.rule_depth.assign(source.size(), 0);
++                auto key_result = source.parse(codec.key, key_input, 0);
++                if (!key_result.success() || key_result.end != property.key().size()) {
++                    throw std::invalid_argument("input_grammar: native codec cannot represent property " + property.key());
++                }
++                auto nested = ctx; nested.argument = property.key();
++                auto value = native_value(property.value(), nested, depth + 1);
++                if (value == COMMON_PEG_INVALID_PARSER_ID) { return value; }
++                members.push_back(sequence({output.add_parser(common_peg_literal_parser{property.key()}), codec.key_end, value}));
++                mandatory.push_back(required.count(property.key()) != 0);
 +            }
-+            property = nullptr; property_name.clear();
-+            auto after = p.eps(), first = p.eps();
-+            const auto separator = node.value("separator", "");
-+            for (size_t i = parts.size(); i-- > 0;) {
-+                auto with_separator = p.literal(separator) + parts[i] + after;
-+                auto without_separator = parts[i] + after;
-+                after = p.rule("parameters-after-" + std::to_string(nodes) + "-" + std::to_string(i),
-+                    mandatory[i] ? with_separator : (with_separator | after));
-+                first = p.rule("parameters-first-" + std::to_string(nodes) + "-" + std::to_string(i),
-+                    mandatory[i] ? without_separator : (without_separator | first));
++            auto after = output.add_parser(common_peg_epsilon_parser{}), first = after;
++            for (size_t i = members.size(); i-- > 0;) {
++                auto separated = sequence({codec.separator, members[i], after});
++                auto initial = sequence({members[i], after});
++                after = mandatory[i] ? separated : output.add_parser(common_peg_choice_parser{{separated, after}});
++                first = mandatory[i] ? initial : output.add_parser(common_peg_choice_parser{{initial, first}});
 +            }
-+            return emit("{") + first + emit("}");
++            return sequence({codec.open, first, codec.close});
 +        }
-+        if (op == "parameter_name") {
-+            require(!property.is_null(), "parameter_name outside parameters");
-+            const auto suffix = node.at("suffix").get<std::string>();
-+            require(!suffix.empty(), "parameter_name requires an atomic closing suffix");
-+            return p.atomic(p.tag("runtime-key", p.literal(property_name)) + p.literal(suffix));
-+        }
-+        if (op == "parameter_value") {
-+            require(!property.is_null(), "parameter_value outside parameters");
-+            if (node.value("scalar_only", false)) {
-+                const auto type = property.value("type", "");
-+                require(type == "string" || type == "integer" || type == "number" || type == "boolean" || type == "null",
-+                        "this descriptor value codec only supports scalar properties");
++        if (type == "array") {
++            static const std::set<std::string> supported = {"type", "items", "minItems", "maxItems", "title", "description"};
++            for (const auto & item : schema.items()) {
++                if (!supported.count(item.key())) { throw std::invalid_argument("input_grammar: unsupported native array constraint " + item.key()); }
 +            }
-+            return value(property, node.value("encoding", "json"), node.value("stop", ""));
++            const auto & codec = source.value_codecs_.at("array");
++            auto item = native_value(schema.at("items"), ctx, depth + 1);
++            if (item == COMMON_PEG_INVALID_PARSER_ID) { return item; }
++            const int min = schema.value("minItems", 0), max = schema.value("maxItems", -1);
++            if (min < 0 || min > 1024 || (max != -1 && (max < min || max > 1024))) {
++                throw std::invalid_argument("input_grammar: native array count exceeds budget");
++            }
++            auto content = output.add_parser(common_peg_epsilon_parser{});
++            if (max != 0) {
++                auto tail = output.add_parser(common_peg_repetition_parser{sequence({codec.separator, item}), std::max(0, min - 1), max == -1 ? -1 : max - 1});
++                auto nonempty = sequence({item, tail});
++                content = min ? nonempty : output.add_parser(common_peg_choice_parser{{nonempty, content}});
++            }
++            return sequence({codec.open, content, codec.close});
 +        }
-+        throw std::invalid_argument("native_tool_format: unknown operation " + op);
++        if (type == "number" || type == "integer" || type == "boolean" || type == "null") {
++            return output.get_rule(external_rule({{"json_schema", schema}}));
++        }
++        throw std::invalid_argument("input_grammar: unsupported native value schema");
++    }
++
++    std::vector<std::string> marker_words(id node, size_t depth = 0) const {
++        if (depth > 64) { throw std::invalid_argument("input_grammar: recursive native prefix marker"); }
++        return std::visit([&](const auto & p) -> std::vector<std::string> {
++            using T = std::decay_t<decltype(p)>;
++            if constexpr (std::is_same_v<T, common_peg_literal_parser>) { return {p.literal}; }
++            else if constexpr (std::is_same_v<T, common_peg_epsilon_parser>) { return {""}; }
++            else if constexpr (std::is_same_v<T, common_peg_until_parser>) { return p.delimiters; }
++            else if constexpr (std::is_same_v<T, common_peg_rule_parser> || std::is_same_v<T, common_peg_atomic_parser> ||
++                std::is_same_v<T, common_peg_tag_parser>) { return marker_words(p.child, depth + 1); }
++            else if constexpr (std::is_same_v<T, common_peg_ref_parser>) { return marker_words(source.get_rule(p.name), depth + 1); }
++            else if constexpr (std::is_same_v<T, common_peg_repetition_parser>) {
++                if (p.min_count != 0 || p.max_count != 1) { throw std::invalid_argument("input_grammar: native prefix marker is not finite"); }
++                auto words = marker_words(p.child, depth + 1);
++                words.insert(words.begin(), "");
++                return words;
++            } else if constexpr (std::is_same_v<T, common_peg_sequence_parser>) {
++                std::vector<std::string> words{""};
++                for (auto child : p.children) {
++                    std::vector<std::string> joined;
++                    for (const auto & prefix : words) {
++                        for (const auto & suffix : marker_words(child, depth + 1)) {
++                            if (joined.size() >= 128 || prefix.size() + suffix.size() > 4096) { throw std::invalid_argument("input_grammar: native prefix marker exceeds budget"); }
++                            joined.push_back(prefix + suffix);
++                        }
++                    }
++                    words = std::move(joined);
++                }
++                return words;
++            } else if constexpr (std::is_same_v<T, common_peg_choice_parser>) {
++                std::vector<std::string> words;
++                for (auto child : p.children) {
++                    auto part = marker_words(child, depth + 1);
++                    words.insert(words.end(), part.begin(), part.end());
++                }
++                return words;
++            }
++            throw std::invalid_argument("input_grammar: native prefix marker is not a literal language");
++        }, source.get(node));
++    }
++
++    std::string prefix_language(llama_grammar_parser & parsed, const std::map<uint32_t, std::string> & external_ids) const {
++        using symbols = std::vector<uint32_t>;
++        using state_key = std::pair<size_t, symbols>;
++        struct edge { symbols word; size_t next; bool replay; bool tool; };
++        struct transition { bool valid; bool tool; state_key state; symbols marker; };
++        if (source.prefix_states_.empty() || source.prefix_root_ >= source.prefix_states_.size()) {
++            throw std::invalid_argument("input_grammar: native parser has no prefix control binding");
++        }
++        std::vector<std::vector<edge>> edges(source.prefix_states_.size());
++        std::set<uint32_t> alphabet;
++        for (size_t i = 0; i < edges.size(); ++i) {
++            if (source.prefix_states_[i].whitespace) { alphabet.insert({' ', '\t', '\n', '\r', '\f', '\v'}); }
++            for (const auto & item : source.prefix_states_[i].edges) {
++                for (const auto & word : marker_words(item.marker)) {
++                    auto cps = unicode_cpts_from_utf8(word);
++                    if (item.tool && cps.empty()) { throw std::invalid_argument("input_grammar: empty native tool entry"); }
++                    alphabet.insert(cps.begin(), cps.end());
++                    edges[i].push_back({std::move(cps), item.next, item.replay, item.tool});
++                }
++            }
++        }
++        if (edges.size() > 128 || alphabet.size() > 512) { throw std::invalid_argument("input_grammar: native prefix controls exceed budget"); }
++        auto normalize = [&](state_key key) -> transition {
++            for (size_t steps = 0; steps < 16384; ++steps) {
++                const auto & state = source.prefix_states_.at(key.first);
++                bool partial = false, moved = false;
++                for (const auto & item : edges.at(key.first)) {
++                    const size_t common = std::min(item.word.size(), key.second.size());
++                    if (!std::equal(item.word.begin(), item.word.begin() + common, key.second.begin())) { continue; }
++                    if (key.second.size() < item.word.size()) { partial = true; continue; }
++                    if (item.tool) {
++                        if (key.second.size() != item.word.size()) {
++                            throw std::invalid_argument("input_grammar: prefix lookahead extends past native tool entry");
++                        }
++                        return {true, true, {}, item.word};
++                    }
++                    key.first = item.next;
++                    if (!item.replay) { key.second.erase(key.second.begin(), key.second.begin() + item.word.size()); }
++                    moved = true;
++                    break;
++                }
++                if (moved) { continue; }
++                if (partial || key.second.empty()) { return {true, false, std::move(key), {}}; }
++                if (state.whitespace && key.second.front() < 128 && std::isspace(static_cast<unsigned char>(key.second.front()))) {
++                    key.second.erase(key.second.begin());
++                    continue;
++                }
++                if (state.fallback != COMMON_PEG_INVALID_PARSER_ID) { key.first = state.fallback; continue; }
++                if (!state.scan) { return {false, false, {}, {}}; }
++                key.second.erase(key.second.begin());
++            }
++            throw std::invalid_argument("input_grammar: native prefix control cycle");
++        };
++        auto can_end = [&](state_key key) {
++            std::set<size_t> seen;
++            while (seen.insert(key.first).second) {
++                const auto & state = source.prefix_states_.at(key.first);
++                if (state.complete && (state.scan || key.second.empty())) { return true; }
++                if (!key.second.empty() || state.fallback == COMMON_PEG_INVALID_PARSER_ID) { return false; }
++                key.first = state.fallback;
++            }
++            return false;
++        };
++        std::map<symbols, uint32_t> suffix_rules;
++        auto suffix_rule = [&](const symbols & marker) {
++            if (auto found = suffix_rules.find(marker); found != suffix_rules.end()) { return found->second; }
++            auto c_rules = parsed.c_rules();
++            std::unique_ptr<llama_grammar, decltype(&llama_grammar_free_impl)> grammar(
++                llama_grammar_init_impl(nullptr, c_rules.data(), c_rules.size(), parsed.symbol_ids.at("root")), llama_grammar_free_impl);
++            if (!grammar) { throw std::invalid_argument("input_grammar: cannot derive native tool entry"); }
++            for (auto cp : marker) { llama_grammar_accept_str(*grammar, unicode_cpt_to_utf8(cp)); }
++            const auto & stacks = llama_grammar_get_stacks(grammar.get());
++            if (stacks.empty()) { throw std::invalid_argument("input_grammar: native tool marker does not match its grammar"); }
++            std::map<const llama_grammar_element *, std::pair<uint32_t, size_t>> positions;
++            const auto & rules = llama_grammar_get_rules(grammar.get());
++            for (uint32_t i = 0; i < rules.size(); ++i) {
++                for (size_t j = 0; j < rules[i].size(); ++j) { positions[&rules[i][j]] = {i, j}; }
++            }
++            llama_grammar_rule derivative;
++            for (const auto & stack : stacks) {
++                if (!derivative.empty()) { derivative.push_back({LLAMA_GRETYPE_ALT, 0}); }
++                for (auto entry = stack.rbegin(); entry != stack.rend(); ++entry) {
++                    const auto [rule_id, offset] = positions.at(*entry);
++                    if (external_ids.count(rule_id)) {
++                        if (offset != 0) { throw std::invalid_argument("input_grammar: native trigger enters a body grammar"); }
++                        derivative.push_back({LLAMA_GRETYPE_RULE_REF, rule_id});
++                        continue;
++                    }
++                    for (size_t pos = offset; pos < rules[rule_id].size(); ++pos) {
++                        auto element = rules[rule_id][pos];
++                        if (element.type == LLAMA_GRETYPE_ALT || element.type == LLAMA_GRETYPE_END) { break; }
++                        derivative.push_back(element);
++                    }
++                }
++            }
++            derivative.push_back({LLAMA_GRETYPE_END, 0});
++            auto id = static_cast<uint32_t>(parsed.rules.size());
++            parsed.rules.push_back(std::move(derivative));
++            suffix_rules[marker] = id;
++            return id;
++        };
++        auto start = normalize({source.prefix_root_, {}});
++        if (!start.valid || start.tool) { throw std::invalid_argument("input_grammar: invalid native prefix start"); }
++        std::vector<state_key> states{start.state};
++        std::map<state_key, size_t> ids{{start.state, 0}};
++        uint32_t other = 0x10ffff;
++        while (alphabet.count(other)) { --other; }
++        std::vector<uint32_t> characters(alphabet.begin(), alphabet.end());
++        characters.push_back(other);
++        std::string rules;
++        for (size_t index = 0; index < states.size(); ++index) {
++            if (states.size() > 4096) { throw std::invalid_argument("input_grammar: native prefix DFA exceeds budget"); }
++            const auto current = states[index];
++            std::map<std::string, std::vector<uint32_t>> targets;
++            for (auto cp : characters) {
++                auto next_key = current;
++                next_key.second.push_back(cp);
++                auto next = normalize(std::move(next_key));
++                if (!next.valid) { continue; }
++                std::string target;
++                if (next.tool) { target = "r" + std::to_string(suffix_rule(next.marker)); }
++                else {
++                    auto found = ids.find(next.state);
++                    if (found == ids.end()) {
++                        auto id = states.size();
++                        states.push_back(next.state);
++                        found = ids.emplace(next.state, id).first;
++                    }
++                    target = "p" + std::to_string(found->second);
++                }
++                targets[target].push_back(cp);
++            }
++            std::vector<std::string> alternatives;
++            if (allow_plain && can_end(current)) { alternatives.push_back("\"\""); }
++            for (const auto & target : targets) {
++                const bool has_other = std::find(target.second.begin(), target.second.end(), other) != target.second.end();
++                std::string pattern = has_other ? "/[^" : "/[";
++                if (has_other) {
++                    for (auto cp : alphabet) {
++                        if (std::find(target.second.begin(), target.second.end(), cp) == target.second.end()) { pattern += codepoint(cp); }
++                    }
++                } else { for (auto cp : target.second) { pattern += codepoint(cp); } }
++                if (pattern == "/[^") { pattern = "/(?s:.)/"; }
++                else { pattern += "]/"; }
++                alternatives.push_back(pattern + " " + target.first);
++            }
++            if (alternatives.empty()) { throw std::invalid_argument("input_grammar: native prefix has a dead state"); }
++            rules += "p" + std::to_string(index) + ": ";
++            for (size_t i = 0; i < alternatives.size(); ++i) { rules += (i ? " | " : "") + alternatives[i]; }
++            rules += "\n";
++        }
++        return rules + "start: p0\n";
++    }
++
++    result compile(id node, context ctx = {}, size_t depth = 0) {
++        if (++visits > 50000 || depth > 128) { throw std::invalid_argument("input_grammar: native graph expansion exceeds budget"); }
++        if (ctx.tool.empty()) {
++            auto tools = names(node, common_chat_peg_builder::TOOL_NAME);
++            if (tools.size() == 1) {
++                if (!parameters.count(*tools.begin())) { throw std::invalid_argument("input_grammar: unknown native tool branch"); }
++                ctx.tool = *tools.begin();
++            }
++        }
++        const auto key = std::make_tuple(node, ctx.tool, ctx.argument, ctx.forbidden_prefixes);
++        if (auto found = cache.find(key); found != cache.end()) { return found->second; }
++        cache[key] = {node, false};
++        const auto & value = source.get(node);
++        auto node_tag = std::get_if<common_peg_tag_parser>(&value);
++        auto semantic = source.semantics_.find(node);
++        const bool args_container = (node_tag && node_tag->tag == common_chat_peg_builder::TOOL_ARGS) ||
++            (semantic != source.semantics_.end() && semantic->second == common_chat_peg_builder::TOOL_ARGS);
++        if (args_container && !ctx.tool.empty() && !names(node, common_chat_peg_builder::TOOL_ARG_NAME).empty()) {
++            const auto & schema = parameters.at(ctx.tool);
++            require_object(schema);
++            std::set<id> seen;
++            if (!concatenated_arguments(node, seen)) { throw std::invalid_argument("input_grammar: native argument separators need a codec binding"); }
++            std::map<std::string, id> arguments;
++            for (auto child : descendants(node)) {
++                if (auto tag = std::get_if<common_peg_tag_parser>(&source.get(child)); tag && tag->tag == common_chat_peg_builder::TOOL_ARG) {
++                    auto keys = names(child, common_chat_peg_builder::TOOL_ARG_NAME);
++                    if (keys.size() != 1) { throw std::invalid_argument("input_grammar: ambiguous native parameter binding"); }
++                    arguments.emplace(*keys.begin(), child);
++                }
++            }
++            std::set<std::string> required;
++            for (const auto & name : schema.value("required", json::array())) { required.insert(name.get<std::string>()); }
++            std::vector<id> members, optional_members;
++            for (const auto & property : schema.at("properties").items()) {
++                auto argument = arguments.find(property.key());
++                if (argument == arguments.end()) { throw std::invalid_argument("input_grammar: native parameter is missing"); }
++                auto value = compile(argument->second, ctx, depth + 1);
++                if (value.node == COMMON_PEG_INVALID_PARSER_ID) { return cache[key] = value; }
++                if (required.count(property.key())) { members.push_back(value.node); }
++                else { optional_members.push_back(output.add_parser(common_peg_repetition_parser{value.node, 0, 1})); }
++            }
++            members.insert(members.end(), optional_members.begin(), optional_members.end());
++            validated_tools.insert(ctx.tool);
++            return cache[key] = {sequence(std::move(members)), true};
++        }
++        if (auto tag = std::get_if<common_peg_tag_parser>(&value); tag && !ctx.tool.empty()) {
++            if (tag->tag == common_chat_peg_builder::TOOL_ARG) {
++                auto args = names(node, common_chat_peg_builder::TOOL_ARG_NAME);
++                if (args.size() != 1 || !parameters.at(ctx.tool).at("properties").contains(*args.begin())) { throw std::invalid_argument("input_grammar: cannot bind native argument"); }
++                ctx.argument = *args.begin();
++            }
++            if (tag->tag == common_chat_peg_builder::TOOL_ARGS && names(node, common_chat_peg_builder::TOOL_ARG_NAME).empty()) {
++                if (auto codec = source.value_codecs_.find("object"); codec != source.value_codecs_.end()) {
++                    auto nodes = descendants(tag->child);
++                    if (std::find(nodes.begin(), nodes.end(), codec->second.value) != nodes.end()) {
++                        auto rewritten = native_value(parameters.at(ctx.tool), ctx);
++                        if (rewritten != COMMON_PEG_INVALID_PARSER_ID) { validated_tools.insert(ctx.tool); }
++                        return cache[key] = {rewritten, true};
++                    }
++                }
++                bool json_args = false;
++                for (auto child : descendants(tag->child)) {
++                    if (auto schema = std::get_if<common_peg_schema_parser>(&source.get(child)); schema && !schema->raw) { json_args = true; break; }
++                }
++                if (!json_args) {
++                    const auto & schema = parameters.at(ctx.tool);
++                    if (!bodies.count(ctx.tool) && (schema.empty() ||
++                        (schema.value("type", "") == "object" && schema.value("properties", json::object()).empty() &&
++                         schema.value("required", json::array()).empty()))) {
++                        if (!schema.empty()) { require_object(schema); }
++                        common_peg_parse_context empty_input("");
++                        empty_input.rule_depth.assign(source.size(), 0);
++                        if (source.parse(tag->child, empty_input, 0).success()) {
++                            validated_tools.insert(ctx.tool);
++                            return cache[key] = {node, false};
++                        }
++                    }
++                    throw std::invalid_argument("input_grammar: native argument codec has no semantic binding");
++                }
++                if (!bodies.count(ctx.tool)) {
++                    auto body = external_rule({{"json_schema", parameters.at(ctx.tool)}});
++                    validated_tools.insert(ctx.tool);
++                    return cache[key] = {output.get_rule(body), true};
++                }
++                auto body = external_rule({{"lark_grammar", bodies.at(ctx.tool)}, {"tool_input_mode", "json_string"}});
++                auto name = "native-args-" + std::to_string(output.size());
++                auto rewritten = rule(name, "\"{\\\"input\\\":\\\"\" " + body + " \"\\\"}\"", output.get_rule(body));
++                bound.insert(ctx.tool);
++                validated_tools.insert(ctx.tool);
++                return cache[key] = {rewritten, true};
++            }
++            if (tag->tag == common_chat_peg_builder::TOOL_ARG_STRING_VALUE) {
++                if (ctx.argument.empty() || (bodies.count(ctx.tool) && ctx.argument != "input")) { throw std::invalid_argument("input_grammar: native string is not bound to a parameter"); }
++                std::set<std::string> stops;
++                for (auto child : descendants(tag->child)) {
++                    if (auto until = std::get_if<common_peg_until_parser>(&source.get(child))) {
++                        stops.insert(until->delimiters.begin(), until->delimiters.end());
++                    }
++                }
++                if (stops.size() != 1) { throw std::invalid_argument("input_grammar: native raw string needs one explicit delimiter"); }
++                json definition = {{"tool_input_mode", "raw"}, {"tool_input_stop", *stops.begin()}};
++                if (bodies.count(ctx.tool)) { definition["lark_grammar"] = bodies.at(ctx.tool); }
++                else { definition["json_schema"] = parameters.at(ctx.tool).at("properties").at(ctx.argument); }
++                if (!raw_encoding_is_lossless(definition, ctx)) { return cache[key] = {COMMON_PEG_INVALID_PARSER_ID, true}; }
++                auto name = external_rule(std::move(definition));
++                if (bodies.count(ctx.tool)) { bound.insert(ctx.tool); }
++                return cache[key] = {output.get_rule(name), true};
++            }
++            if (tag->tag == common_chat_peg_builder::TOOL_ARG_VALUE && !ctx.argument.empty()) {
++                bool json_value = false;
++                for (auto child : descendants(tag->child)) {
++                    if (auto schema = std::get_if<common_peg_schema_parser>(&source.get(child)); schema && !schema->raw) { json_value = true; }
++                }
++                if (!json_value) { throw std::invalid_argument("input_grammar: native value codec has no JSON binding"); }
++                auto name = external_rule({{"json_schema", parameters.at(ctx.tool).at("properties").at(ctx.argument)}});
++                return cache[key] = {output.get_rule(name), true};
++            }
++        }
++        result transformed = {node, false};
++        auto replacement = value;
++        bool failed = false;
++        std::visit([&](auto & p) {
++            using T = std::decay_t<decltype(p)>;
++            if constexpr (std::is_same_v<T, common_peg_sequence_parser> || std::is_same_v<T, common_peg_choice_parser>) {
++                std::vector<id> child_nodes;
++                auto next_context = ctx;
++                for (auto child : p.children) {
++                    if constexpr (std::is_same_v<T, common_peg_sequence_parser>) {
++                        if (auto negative = std::get_if<common_peg_not_parser>(&source.get(child))) {
++                            auto prefix = literal(negative->child);
++                            if (!prefix.empty()) { next_context.forbidden_prefixes.push_back(prefix); }
++                        }
++                    }
++                    auto next = compile(child, next_context, depth + 1);
++                    transformed.changed |= next.changed;
++                    if (next.node == COMMON_PEG_INVALID_PARSER_ID) {
++                        if constexpr (std::is_same_v<T, common_peg_sequence_parser>) { failed = true; }
++                    } else { child_nodes.push_back(next.node); }
++                }
++                if (child_nodes.empty() && !p.children.empty()) { failed = true; }
++                p.children = std::move(child_nodes);
++            } else if constexpr (std::is_same_v<T, common_peg_repetition_parser> ||
++                std::is_same_v<T, common_peg_and_parser> || std::is_same_v<T, common_peg_not_parser> ||
++                std::is_same_v<T, common_peg_schema_parser> || std::is_same_v<T, common_peg_rule_parser> ||
++                std::is_same_v<T, common_peg_atomic_parser> || std::is_same_v<T, common_peg_tag_parser> ||
++                std::is_same_v<T, common_peg_gbnf_parser> || std::is_same_v<T, common_peg_ac_parser>) {
++                auto next = compile(p.child, ctx, depth + 1);
++                p.child = next.node; transformed.changed = next.changed;
++                failed = next.node == COMMON_PEG_INVALID_PARSER_ID;
++                if constexpr (std::is_same_v<T, common_peg_repetition_parser>) {
++                    if (!parallel && !names(node, common_chat_peg_builder::TOOL_NAME).empty()) {
++                        if (p.min_count > 1) { throw std::invalid_argument("input_grammar: native format requires multiple calls"); }
++                        p.max_count = p.max_count == 0 ? 0 : 1;
++                        transformed.changed = true;
++                    }
++                    if (!ctx.tool.empty() && !names(node, common_chat_peg_builder::TOOL_ARG_NAME).empty() &&
++                        names(node, common_chat_peg_builder::TOOL_NAME).empty()) {
++                        p.min_count = p.max_count = 1;
++                        transformed.changed = true;
++                    }
++                }
++            } else if constexpr (std::is_same_v<T, common_peg_ref_parser>) {
++                auto next = compile(source.get_rule(p.name), ctx, depth + 1);
++                transformed = next;
++            }
++        }, replacement);
++        if (failed) { return cache[key] = {COMMON_PEG_INVALID_PARSER_ID, true}; }
++        if (!transformed.changed) { return cache[key] = transformed; }
++        if (auto ac = std::get_if<common_peg_ac_parser>(&replacement)) { return cache[key] = {ac->child, true}; }
++        if (auto override = std::get_if<common_peg_gbnf_parser>(&replacement)) { return cache[key] = {override->child, true}; }
++        if (auto ref = std::get_if<common_peg_ref_parser>(&replacement)) { return cache[key] = transformed; }
++        if (auto rule_node = std::get_if<common_peg_rule_parser>(&replacement)) { rule_node->name = "native-rule-" + std::to_string(output.size()); }
++        transformed.node = output.add_parser(std::move(replacement));
++        if (auto rule_node = std::get_if<common_peg_rule_parser>(&output.get(transformed.node))) { output.add_rule(rule_node->name, transformed.node); }
++        return cache[key] = transformed;
 +    }
 +};
-+} // namespace
 +
-+common_chat_params common_chat_apply_runtime_format(const common_chat_template & tmpl,
-+        const autoparser::generation_params & params, const common_chat_templates_inputs & inputs) {
++void common_chat_apply_tool_grammars(common_chat_params & data, const common_chat_templates_inputs & inputs) {
++    if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) { return; }
++    if (std::none_of(inputs.tools.begin(), inputs.tools.end(), [](const common_chat_tool & tool) { return !tool.input_grammar.empty(); })) { return; }
++    common_chat_tool_grammar compiler(data.parser, inputs);
++    if (compiler.bodies.empty()) { return; }
 +#ifndef LLAMA_USE_LLGUIDANCE
-+    throw std::invalid_argument("native_tool_format requires LLAMA_LLGUIDANCE=ON");
++    throw std::invalid_argument("input_grammar requires LLAMA_LLGUIDANCE=ON");
 +#endif
-+    const auto & spec = inputs.native_tool_format;
-+    if (!spec.is_object() || spec.value("version", 0) != 1 || spec.dump().size() > 1024 * 1024) {
-+        throw std::invalid_argument("native_tool_format: expected version 1 descriptor, at most 1 MiB");
-+    }
-+    if (!inputs.grammar.empty() || !inputs.json_schema.empty() || inputs.force_pure_content ||
++    if (!inputs.use_jinja || !inputs.grammar.empty() || !inputs.json_schema.empty() || inputs.force_pure_content ||
 +        inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE) {
-+        throw std::invalid_argument("native_tool_format cannot combine with grammar, response schema, pure content or continuation");
++        throw std::invalid_argument("input_grammar requires native Jinja without custom grammar, response schema or continuation");
 +    }
-+    std::set<std::string> names;
-+    for (const auto & tool : inputs.tools) {
-+        if (!names.insert(tool.name).second) { throw std::invalid_argument("native_tool_format: duplicate tool name"); }
-+        if (tool.name.empty() || tool.name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-") != std::string::npos) {
-+            throw std::invalid_argument("native_tool_format: tool name must use ASCII letters, digits, underscore, dot or dash");
++    auto root = compiler.compile(data.parser.root());
++    if (root.node == COMMON_PEG_INVALID_PARSER_ID || compiler.bound.size() != compiler.bodies.size() ||
++        compiler.validated_tools.size() != compiler.parameters.size()) {
++        auto error = compiler.encoding_errors.empty() ? "no supported native body binding" : compiler.encoding_errors.front();
++        throw std::invalid_argument("input_grammar: " + error);
++    }
++    compiler.output.set_root(root.node);
++    std::set<common_peg_parser_id> reachable, entries;
++    std::vector<common_peg_parser_id> pending{root.node};
++    while (!pending.empty()) {
++        auto node = pending.back(); pending.pop_back();
++        if (!reachable.insert(node).second) { continue; }
++        if (auto rule = std::get_if<common_peg_rule_parser>(&compiler.output.get(node)); rule && rule->trigger) {
++            entries.insert(node);
++            continue;
++        }
++        auto child_nodes = common_chat_tool_grammar::children(compiler.output.get(node));
++        pending.insert(pending.end(), child_nodes.begin(), child_nodes.end());
++    }
++    for (size_t node = 0; node < compiler.output.size(); ++node) {
++        if (auto rule = std::get_if<common_peg_rule_parser>(&compiler.output.get(node)); rule && !entries.count(node)) {
++            rule->trigger = false;
 +        }
 +    }
-+    common_chat_params data;
-+    data.prompt = common_chat_template_direct_apply_impl(tmpl, params);
-+    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, params);
-+    data.format = COMMON_CHAT_FORMAT_PEG_RUNTIME;
-+    data.preserved_tokens = spec.value("preserved_tokens", std::vector<std::string>{});
-+    data.additional_stops = spec.value("additional_stops", std::vector<std::string>{});
-+    data.supports_thinking = inputs.enable_thinking;
-+    data.thinking_start_tag = spec.value("thinking_start", "");
-+    data.thinking_end_tags = spec.value("thinking_end", std::vector<std::string>{});
-+    std::map<std::string, json> external;
-+    data.parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
-+        format_compiler compiler{p, inputs, spec, data.generation_prompt};
-+        auto root = compiler.compile(spec.at("root"));
-+        if (inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE && compiler.bound != names) {
-+            throw std::invalid_argument("native_tool_format: every tool must bind its arguments to grammar/schema");
-+        }
-+        external = std::move(compiler.external);
-+        return p.literal(data.generation_prompt) + root + p.end();
-+    });
-+    const auto gbnf = build_grammar([&](const common_grammar_builder & builder) { data.parser.build_grammar(builder); });
++    auto gbnf = build_grammar([&](const common_grammar_builder & builder) { compiler.output.build_grammar(builder, true); });
 +    llama_grammar_parser parsed;
-+    if (!parsed.parse(gbnf.c_str())) { throw std::invalid_argument("native_tool_format: invalid generated grammar"); }
++    if (!parsed.parse(gbnf.c_str())) { throw std::invalid_argument("input_grammar: invalid native sampling grammar"); }
 +    json grammars = json::array({json::object()});
 +    std::map<uint32_t, std::string> replacements;
-+    for (auto & entry : external) {
-+        const auto id = parsed.symbol_ids.at(entry.first);
-+        const auto name = "body" + std::to_string(grammars.size());
-+        replacements[id] = "@" + name;
++    for (auto & entry : compiler.external) {
++        auto symbol = parsed.symbol_ids.find(entry.first);
++        if (symbol == parsed.symbol_ids.end()) { continue; }
++        auto name = "body" + std::to_string(grammars.size());
++        replacements[symbol->second] = "@" + name;
 +        entry.second["name"] = name;
 +        grammars.push_back(std::move(entry.second));
 +    }
-+    grammars[0] = {{"name", "native"}, {"lark_grammar", emit_lark(parsed, "r", replacements) +
-+        "start: r" + std::to_string(parsed.symbol_ids.at("root")) + "\n"}};
-+    auto markers = data.preserved_tokens;
-+    markers.push_back(data.generation_prompt);
-+    data.grammar = "%llguidance-json\n" + json{{"grammars", grammars}, {"native_tokens", markers}}.dump();
-+    return data;
++    auto prefix = compiler.prefix_language(parsed, replacements);
++    grammars[0] = {{"name", "native"}, {"lark_grammar", emit_lark(parsed, "r", replacements) + prefix}};
++    for (size_t node = 0; node < data.parser.size(); ++node) {
++        if (auto literal = std::get_if<common_peg_literal_parser>(&data.parser.get(node)); literal && !literal->literal.empty()) {
++            data.preserved_tokens.push_back(literal->literal);
++        }
++    }
++    std::sort(data.preserved_tokens.begin(), data.preserved_tokens.end());
++    data.preserved_tokens.erase(std::unique(data.preserved_tokens.begin(), data.preserved_tokens.end()), data.preserved_tokens.end());
++    auto tokens = data.preserved_tokens;
++    tokens.push_back(data.generation_prompt);
++    data.grammar = "%llguidance-json\n" + json{{"grammars", grammars}, {"native_tokens", tokens}}.dump();
++    data.grammar_lazy = false;
++    data.grammar_triggers.clear();
++    data.strict_tool_grammar = true;
++    data.grammar_requires_tool = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
++    data.grammar_allows_parallel = inputs.parallel_tool_calls;
 +}
 +
-+common_chat_msg common_chat_runtime_map(const common_peg_ast_arena & arena, const common_peg_parse_result & parsed) {
-+    common_chat_msg result;
-+    result.role = "assistant";
-+    common_chat_tool_call pending;
-+    common_chat_tool_call * call = nullptr;
-+    bool has_key = false;
-+    arena.visit(parsed, [&](const common_peg_ast_node & node) {
-+        const auto text = node.sanitized_text();
-+        if (node.tag == "content") { result.content += text; }
-+        else if (node.tag == "reasoning") { result.reasoning_content += text; }
-+        else if (node.tag == "runtime-tool") { pending = {}; call = &pending; has_key = false; }
-+        else if (node.tag == "runtime-name") {
-+            pending.name = text;
-+            result.tool_calls.push_back(pending);
-+            call = &result.tool_calls.back();
-+        } else if (call) {
-+            if (node.tag == "runtime-json") { call->arguments += text; }
-+            else if (node.tag == "runtime-string") {
-+                auto quoted = json(text).dump();
-+                if (node.is_partial) { quoted.pop_back(); }
-+                call->arguments += quoted;
-+            } else if (node.tag == "runtime-key") {
-+                if (has_key) { call->arguments += ","; }
-+                call->arguments += json(text).dump() + ":";
-+                has_key = true;
-+            } else if (node.tag.compare(0, 13, "runtime-emit:") == 0) { call->arguments += node.tag.substr(13); }
-+        }
-+    });
-+    return result;
-+}
 diff --git a/common/chat.cpp b/common/chat.cpp
-index 5f956e6..dfebcda 100644
+index 5f956e6..78131ce 100644
 --- a/common/chat.cpp
 +++ b/common/chat.cpp
 @@ -627,6 +627,9 @@ json common_chat_tools_to_json_oaicompat(const std::vector<common_chat_tool> & t
@@ -442,26 +962,7 @@ index 5f956e6..dfebcda 100644
                  });
              }
          }
-@@ -997,6 +1019,7 @@ const char * common_chat_format_name(common_chat_format format) {
-             return "Content-only";
-         case COMMON_CHAT_FORMAT_PEG_SIMPLE:
-             return "peg-simple";
-+        case COMMON_CHAT_FORMAT_PEG_RUNTIME: return "runtime";
-         case COMMON_CHAT_FORMAT_PEG_NATIVE:
-             return "peg-native";
-         case COMMON_CHAT_FORMAT_PEG_GEMMA4:
-@@ -1555,6 +1578,10 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
-         }
-     }
- 
-+    if (!inputs.native_tool_format.is_null()) {
-+        return common_chat_apply_runtime_format(tmpl, params, inputs);
-+    }
-+
-     if (inputs.force_pure_content) {
-         LOG_WRN("Forcing pure content template, will not render reasoning or tools separately.");
-         // Create the result structure
-@@ -1678,8 +1705,19 @@ static common_chat_params common_chat_templates_apply_legacy(const struct common
+@@ -1678,8 +1700,10 @@ static common_chat_params common_chat_templates_apply_legacy(const struct common
  common_chat_params common_chat_templates_apply(const struct common_chat_templates *        tmpls,
                                                 const struct common_chat_templates_inputs & inputs) {
      GGML_ASSERT(tmpls != nullptr);
@@ -469,47 +970,58 @@ index 5f956e6..dfebcda 100644
 -                              common_chat_templates_apply_legacy(tmpls, inputs);
 +    auto data = inputs.use_jinja ? common_chat_templates_apply_jinja(tmpls, inputs) :
 +                                  common_chat_templates_apply_legacy(tmpls, inputs);
-+    if (inputs.native_tool_format.is_null() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
-+        for (const auto & tool : inputs.tools) {
-+            if (!tool.input_grammar.empty()) {
-+                throw std::invalid_argument("input_grammar requires native_tool_format version 1");
-+            }
-+        }
-+    }
-+    if (!inputs.use_jinja && !inputs.native_tool_format.is_null()) {
-+        throw std::invalid_argument("native_tool_format requires Jinja");
-+    }
++    common_chat_apply_tool_grammars(data, inputs);
 +    return data;
  }
  
  std::string common_chat_prompt::str() const {
-@@ -1802,7 +1840,8 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
- 
-     //LOG_DBG("Parsing PEG input with format %s: %s\n", common_chat_format_name(params.format), effective_input.text.c_str());
- 
--    common_peg_parse_flags flags = COMMON_PEG_PARSE_FLAG_LENIENT;
-+    common_peg_parse_flags flags = params.format == COMMON_CHAT_FORMAT_PEG_RUNTIME && !is_partial ?
-+        COMMON_PEG_PARSE_FLAG_NONE : COMMON_PEG_PARSE_FLAG_LENIENT;
-     if (!is_partial) {
-         flags |= COMMON_PEG_PARSE_FLAG_COMPLETE;
-     }
-@@ -1813,6 +1852,14 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
+@@ -1813,6 +1837,22 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
      common_peg_parse_context ctx(std::move(effective_input.text), std::move(effective_input.tokens), flags);
      auto result = parser.parse(ctx);
  
-+    if (params.format == COMMON_CHAT_FORMAT_PEG_RUNTIME) {
-+        if ((!is_partial && (!result.success() || result.end != ctx.input.size())) ||
-+            (is_partial && result.fail())) {
-+            throw std::runtime_error("output does not match native_tool_format");
++    if (params.strict_tool_grammar && !is_partial) {
++        bool has_tool = false;
++        ctx.ast.visit(result, [&](const common_peg_ast_node & node) {
++            has_tool |= node.tag == common_chat_peg_builder::TOOL ||
++                node.tag == common_chat_peg_builder::TOOL_OPEN ||
++                node.tag == common_chat_peg_builder::TOOL_NAME;
++        });
++        if (has_tool) {
++            common_peg_parse_context strict_ctx(ctx.input, ctx.tokens, COMMON_PEG_PARSE_FLAG_COMPLETE);
++            auto strict_result = parser.parse(strict_ctx);
++            if (!strict_result.success() || strict_result.end != ctx.input.size()) {
++                throw std::runtime_error("native tool grammar output is incomplete or invalid");
++            }
 +        }
-+        return common_chat_runtime_map(ctx.ast, result);
 +    }
 +
      if (result.fail()) {
          // During partial parsing, return partial results if any AST nodes were captured
          // This allows streaming to work correctly for formats like FUNC_MARKDOWN_CODE_BLOCK
+@@ -1853,6 +1893,11 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
+         mapper = std::make_unique<common_chat_peg_mapper>(msg);
+     }
+     mapper->from_ast(ctx.ast, result);
++    if (params.strict_tool_grammar && !is_partial &&
++        ((params.grammar_requires_tool && msg.tool_calls.empty()) ||
++         (!params.grammar_allows_parallel && msg.tool_calls.size() > 1))) {
++        throw std::runtime_error("native tool grammar response violates tool choice");
++    }
+ 
+     if (ctx.is_debug()) {
+         fprintf(stderr, "\nAST for %s parse:\n%s\n", is_partial ? "partial" : "full", ctx.ast.dump().c_str());
+@@ -1883,6 +1928,9 @@ common_chat_session::common_chat_session(const common_chat_templates *        tm
+     thinking_ends          = std::move(applied.thinking_end_tags);
+ 
+     parser_params.format            = applied.format;
++    parser_params.strict_tool_grammar = applied.strict_tool_grammar;
++    parser_params.grammar_requires_tool = applied.grammar_requires_tool;
++    parser_params.grammar_allows_parallel = applied.grammar_allows_parallel;
+     parser_params.generation_prompt = vocab ? common_chat_input_tokenize(vocab, applied.generation_prompt)
+                                             : common_chat_input(applied.generation_prompt);
+     parser_params.debug             = params.debug;
 diff --git a/common/chat.h b/common/chat.h
-index ebfc80f..98545b6 100644
+index ebfc80f..9407234 100644
 --- a/common/chat.h
 +++ b/common/chat.h
 @@ -230,6 +230,7 @@ struct common_chat_tool {
@@ -520,37 +1032,50 @@ index ebfc80f..98545b6 100644
  };
  
  enum common_chat_tool_choice {
-@@ -244,6 +245,7 @@ enum common_chat_format {
-     // These are intended to be parsed by the PEG parser
-     COMMON_CHAT_FORMAT_PEG_SIMPLE,
-     COMMON_CHAT_FORMAT_PEG_NATIVE,
-+    COMMON_CHAT_FORMAT_PEG_RUNTIME,
-     COMMON_CHAT_FORMAT_PEG_GEMMA4,
-     COMMON_CHAT_FORMAT_PEG_MINIMAX_M3,
- 
-@@ -277,6 +279,7 @@ struct common_chat_templates_inputs {
-     bool                                  add_bos = false;
-     bool                                  add_eos = false;
-     bool                                  force_pure_content = false;
-+    common_json                           native_tool_format;
+@@ -306,6 +307,9 @@ struct common_chat_params {
+     common_chat_prompt                  prompt;
+     std::string                         grammar;
+     bool                                grammar_lazy         = false;
++    bool                                strict_tool_grammar   = false;
++    bool                                grammar_requires_tool = false;
++    bool                                grammar_allows_parallel = true;
+     std::string                         generation_prompt;
+     bool                                supports_thinking    = false;
+     std::string                         thinking_start_tag;  // e.g., "<think>"
+@@ -347,11 +351,17 @@ common_chat_input common_chat_input_tokenize(const llama_vocab * vocab, const st
+ struct common_chat_parser_params {
+     common_chat_format format = COMMON_CHAT_FORMAT_CONTENT_ONLY;
+     common_chat_input  generation_prompt;
++    bool               strict_tool_grammar = false;
++    bool               grammar_requires_tool = false;
++    bool               grammar_allows_parallel = true;
+     bool               debug  = false; // Enable debug output for PEG parser
+     common_peg_arena   parser = {};
+     common_chat_parser_params() = default;
+     common_chat_parser_params(const common_chat_params & chat_params) {
+         format  = chat_params.format;
++        strict_tool_grammar = chat_params.strict_tool_grammar;
++        grammar_requires_tool = chat_params.grammar_requires_tool;
++        grammar_allows_parallel = chat_params.grammar_allows_parallel;
+         generation_prompt = common_chat_input(chat_params.generation_prompt);
+     }
  };
- 
- struct common_chat_prompt_part {
 diff --git a/common/llguidance.cpp b/common/llguidance.cpp
-index 500bb09..f927e8c 100644
+index 500bb09..a618acf 100644
 --- a/common/llguidance.cpp
 +++ b/common/llguidance.cpp
-@@ -1,5 +1,9 @@
+@@ -1,5 +1,10 @@
  #include "sampling.h"
  #include "log.h"
 +#include "json.h"
 +
 +#include <cstring>
 +#include <set>
++#include <mutex>
  
  #ifdef LLAMA_USE_LLGUIDANCE
  
-@@ -39,7 +43,9 @@ static const char * llama_sampler_llg_name(const llama_sampler * /*smpl*/) {
+@@ -39,7 +44,9 @@ static const char * llama_sampler_llg_name(const llama_sampler * /*smpl*/) {
  static void llama_sampler_llg_accept_impl(llama_sampler * smpl, llama_token token) {
      auto * ctx = (llama_sampler_llg *) smpl->ctx;
      if (ctx->grammar) {
@@ -561,7 +1086,7 @@ index 500bb09..f927e8c 100644
      }
  }
  
-@@ -51,13 +57,13 @@ static void llama_sampler_llg_apply(llama_sampler * smpl, llama_token_data_array
+@@ -51,13 +58,13 @@ static void llama_sampler_llg_apply(llama_sampler * smpl, llama_token_data_array
              if (llg_matcher_compute_mask(ctx->grammar) == 0) {
                  mask = llg_matcher_get_mask(ctx->grammar);
              } else {
@@ -579,13 +1104,15 @@ index 500bb09..f927e8c 100644
          for (size_t i = 0; i < cur_p->size; ++i) {
              auto token = cur_p->data[i].id;
              if ((mask[token / 32] & (1 << (token % 32))) == 0) {
-@@ -136,12 +142,14 @@ static size_t llama_sampler_llg_tokenize_fn(const void * user_data, const uint8_
+@@ -136,12 +143,16 @@ static size_t llama_sampler_llg_tokenize_fn(const void * user_data, const uint8_
      return r;
  }
  
 -static LlgTokenizer * llama_sampler_llg_new_tokenizer(const llama_vocab * vocab) {
 +static LlgTokenizer * llama_sampler_llg_new_tokenizer(const llama_vocab * vocab,
 +                                                      const std::set<std::string> & native_tokens) {
++    static std::mutex cache_mutex;
++    std::lock_guard<std::mutex> lock(cache_mutex);
      // TODO store the tokenizer in the vocab somehow
      static const llama_vocab * vocab_cache;
      static LlgTokenizer *      tokenizer_cache;
@@ -596,7 +1123,7 @@ index 500bb09..f927e8c 100644
          return llg_clone_tokenizer(tokenizer_cache);
      }
  
-@@ -176,8 +184,13 @@ static LlgTokenizer * llama_sampler_llg_new_tokenizer(const llama_vocab * vocab)
+@@ -176,8 +187,13 @@ static LlgTokenizer * llama_sampler_llg_new_tokenizer(const llama_vocab * vocab)
                  GGML_ABORT("llama_detokenize failed\n");
              }
              if (size != 0) {
@@ -612,7 +1139,7 @@ index 500bb09..f927e8c 100644
              }
          }
  
-@@ -214,16 +227,34 @@ static LlgTokenizer * llama_sampler_llg_new_tokenizer(const llama_vocab * vocab)
+@@ -214,16 +230,34 @@ static LlgTokenizer * llama_sampler_llg_new_tokenizer(const llama_vocab * vocab)
      }
      vocab_cache     = vocab;
      tokenizer_cache = tokenizer;
@@ -648,7 +1175,7 @@ index 500bb09..f927e8c 100644
          *ctx           = {
              /* .vocab        = */ vocab,
              /* .grammar_kind = */ grammar_kind,
-@@ -231,6 +262,11 @@ llama_sampler * llama_sampler_init_llg(const llama_vocab * vocab, const char * g
+@@ -231,6 +265,11 @@ llama_sampler * llama_sampler_init_llg(const llama_vocab * vocab, const char * g
              /* .tokenizer    = */ tokenizer,
              /* .grammar      = */ llama_sampler_llg_new(tokenizer, grammar_kind, grammar_data),
          };
@@ -660,6 +1187,304 @@ index 500bb09..f927e8c 100644
          if (ctx->grammar) {
              GGML_ASSERT(((size_t) llama_vocab_n_tokens(vocab) + 31) / 32 * 4 ==
                          llg_matcher_get_mask_byte_size(ctx->grammar));
+diff --git a/common/parsers/gemma4.cpp b/common/parsers/gemma4.cpp
+index 1a63fa9..f3fcb59 100644
+--- a/common/parsers/gemma4.cpp
++++ b/common/parsers/gemma4.cpp
+@@ -199,16 +199,21 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &
+     auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+ 
+     data.parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+-        auto start = p.rule("start", p.optional(p.literal("<|turn>model\n")));
++        auto header_marker = p.literal("<|turn>model\n");
++        auto channel_open = p.literal("<|channel>"), channel_close = p.literal("<channel|>");
++        auto thought_word = p.literal("thought");
++        auto thought_open = channel_open + thought_word;
++        auto call_marker = p.literal("<|tool_call>");
++        auto start = p.rule("start", p.optional(header_marker));
+ 
+         if (extract_reasoning) {
+-            p.rule("thought", p.literal("<|channel>thought") + p.space() + p.reasoning(p.until("<channel|>")) + p.literal("<channel|>"));
++            p.rule("thought", thought_open + p.space() + p.reasoning(p.until("<channel|>")) + channel_close);
+         } else {
+-            p.rule("thought", p.content(p.literal("<|channel>thought") + p.space() + p.until("<channel|>") + p.literal("<channel|>")));
++            p.rule("thought", p.content(thought_open + p.space() + p.until("<channel|>") + channel_close));
+         }
+ 
+-        auto consume_empty_channels = p.gbnf(p.zero_or_more(p.literal("<|channel>") + p.negate(p.literal("thought"))), "");
+-        auto thought = (p.peek(p.literal("<|channel>")) + consume_empty_channels + p.ref("thought")) | p.negate(p.literal("<|channel>"));
++        auto consume_empty_channels = p.gbnf(p.zero_or_more(channel_open + p.negate(thought_word)), "");
++        auto thought = (p.peek(channel_open) + consume_empty_channels + p.ref("thought")) | p.negate(channel_open);
+ 
+         if (has_response_format) {
+             auto response_format = p.literal("```json") <<
+@@ -218,33 +223,63 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &
+         }
+ 
+         if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
++            const bool required_prefix = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
++            auto scan_state = p.prefix_state(!required_prefix, !required_prefix);
++            p.prefix_tool(scan_state, call_marker);
++            auto content_state = required_prefix ? scan_state : p.prefix_state(true, true);
++            auto thought_state = p.prefix_state(true, false);
++            p.prefix_edge(thought_state, channel_close, content_state);
++            auto empty_channel_state = p.prefix_state(false, false, required_prefix ? COMMON_PEG_INVALID_PARSER_ID : scan_state);
++            auto after_channel_state = p.prefix_state(false, false, empty_channel_state);
++            p.prefix_edge(after_channel_state, thought_word, thought_state);
++            p.prefix_edge(empty_channel_state, channel_open, after_channel_state);
++            auto message_state = p.prefix_state(false, false, content_state);
++            p.prefix_edge(message_state, channel_open, after_channel_state);
++            if (!required_prefix) {
++                p.prefix_edge(content_state, channel_open, after_channel_state);
++                p.prefix_edge(content_state, channel_close, scan_state);
++                p.prefix_tool(content_state, call_marker);
++            }
++            auto header_state = p.prefix_state(false, false, message_state);
++            p.prefix_edge(header_state, header_marker, message_state);
++            p.prefix_root(header_state);
++
+             // Gemma4 tool calling syntax
+             // Rules should match traversal logic in gemma4_to_json()
++            auto string_marker = p.literal("<|\"|>");
+             p.rule("gemma4-string-content", p.until("<|\"|>"));
+-            p.rule("gemma4-string", p.literal("<|\"|>") + p.ref("gemma4-string-content") + p.literal("<|\"|>"));
++            auto string_value = p.rule("gemma4-string", string_marker + p.ref("gemma4-string-content") + string_marker);
++            p.value_codec("string", {string_value, string_marker, string_marker});
+             p.rule("gemma4-bool", p.json_bool());
+             p.rule("gemma4-null", p.json_null());
+             p.rule("gemma4-number", p.json_number());
+-            p.rule("gemma4-dict-key", p.rule("gemma4-dict-key-name", p.chars("[^:}]", 1, -1)) + p.literal(":"));
++            auto key_name = p.rule("gemma4-dict-key-name", p.chars("[^:}]", 1, -1));
++            auto key_colon = p.literal(":");
++            p.rule("gemma4-dict-key", key_name + key_colon);
+             p.rule("gemma4-dict-kv", p.ref("gemma4-dict-key") + p.space() + p.ref("gemma4-value"));
+-            p.rule("gemma4-dict", [&]() {
+-                auto ws = p.space();
++            auto ws = p.space();
++            auto object_open = p.literal("{"), object_close = p.literal("}");
++            auto separator = p.literal(",");
++            auto object_value = p.rule("gemma4-dict", [&]() {
+                 auto member = p.ref("gemma4-dict-kv");
+-                auto members = p.sequence({member, p.zero_or_more(p.sequence({p.literal(","), ws, member}))});
++                auto members = p.sequence({member, p.zero_or_more(p.sequence({separator, ws, member}))});
+                 return p.sequence({
+-                    p.literal("{"), ws,
+-                    p.choice({p.literal("}"), p.sequence({members, ws, p.literal("}")})})
++                    object_open, ws,
++                    p.choice({object_close, p.sequence({members, ws, object_close})})
+                 });
+             });
+-            p.rule("gemma4-array", [&]() {
+-                auto ws = p.space();
++            p.value_codec("object", {object_value, object_open + ws, ws + object_close,
++                separator + ws, key_name, key_colon + ws});
++            auto array_open = p.literal("["), array_close = p.literal("]");
++            auto array_value = p.rule("gemma4-array", [&]() {
+                 auto value = p.ref("gemma4-value");
+-                auto elements = p.sequence({value, p.zero_or_more(p.sequence({p.literal(","), ws, value}))});
++                auto elements = p.sequence({value, p.zero_or_more(p.sequence({separator, ws, value}))});
+                 return p.sequence({
+-                    p.literal("["), ws,
+-                    p.choice({p.literal("]"), p.sequence({elements, ws, p.literal("]")})})
++                    array_open, ws,
++                    p.choice({array_close, p.sequence({elements, ws, array_close})})
+                 });
+             });
++            p.value_codec("array", {array_value, array_open + ws, ws + array_close, separator + ws});
+             p.rule("gemma4-value", [&]() {
+                 return p.choice({
+                     p.ref("gemma4-string"), p.ref("gemma4-dict"), p.ref("gemma4-array"),
+diff --git a/common/parsers/minicpm5.cpp b/common/parsers/minicpm5.cpp
+index 7609865..4f611a3 100644
+--- a/common/parsers/minicpm5.cpp
++++ b/common/parsers/minicpm5.cpp
+@@ -49,9 +49,11 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
+     data.parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+         auto generation_prompt = p.literal("<|im_start|>assistant\n");
+ 
++        auto think_open = p.literal("<think>"), think_close = p.literal("</think>");
++        auto think_body = p.until("</think>");
+         auto reasoning = p.eps();
+         if (extract_reasoning) {
+-            reasoning = ("<think>" << p.reasoning(p.until("</think>")) << "</think>") + p.space();
++            reasoning = (think_open << p.reasoning(think_body) << think_close) + p.space();
+         }
+ 
+         // Response format parser
+@@ -60,6 +62,19 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
+         }
+ 
+         if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
++            auto text_state = p.prefix_state(true, true);
++            p.prefix_tool(text_state, p.literal("<function"));
++            auto first_state = text_state;
++            if (extract_reasoning) {
++                auto thought_state = p.prefix_state(true, false);
++                p.prefix_edge(thought_state, think_close, text_state);
++                first_state = p.prefix_state(false, false);
++                p.prefix_edge(first_state, think_open, thought_state);
++            }
++            auto header_state = p.prefix_state(false, false);
++            p.prefix_edge(header_state, generation_prompt, first_state);
++            p.prefix_root(header_state);
++
+             // CDATA lets a value carry characters that would otherwise close the tag (e.g.
+             // </param>); capture the inner text only, excluding the CDATA markers.
+             auto string_value = p.choice({
+diff --git a/common/parsers/qwen3-coder.cpp b/common/parsers/qwen3-coder.cpp
+index a68a683..4021c34 100644
+--- a/common/parsers/qwen3-coder.cpp
++++ b/common/parsers/qwen3-coder.cpp
+@@ -76,10 +76,13 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
+ 
+         // The template strips the newline before </think>, so leave it out of the reasoning
+         auto think_body  = p.until_one_of({ "\n</think>", "</think>", "<tool_call>" });
+-        auto think_close = p.literal("\n</think>") | p.literal("</think>") | p.peek(p.literal("<tool_call>"));
++        auto think_open = p.literal("<think>");
++        auto think_end_line = p.literal("\n</think>"), think_end = p.literal("</think>");
++        auto call_marker = p.literal("<tool_call>");
++        auto think_close = think_end_line | think_end | p.peek(call_marker);
+ 
+-        auto reasoning_extracted = p.optional("<think>" + p.space() + p.reasoning(think_body) + think_close);
+-        auto reasoning_skipped   = p.optional("<think>" + p.space() + think_body + think_close);
++        auto reasoning_extracted = p.optional(think_open + p.space() + p.reasoning(think_body) + think_close);
++        auto reasoning_skipped   = p.optional(think_open + p.space() + think_body + think_close);
+ 
+         auto reasoning = p.eps();
+         if (supports_reasoning && extract_reasoning) {
+@@ -97,6 +100,21 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
+ 
+         // Tool call parser
+         if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
++            auto text_state = p.prefix_state(true, true);
++            for (const auto & marker : tool_call_starts) { p.prefix_tool(text_state, p.literal(marker)); }
++            auto first_state = text_state;
++            if (supports_reasoning && extract_reasoning) {
++                auto thought_state = p.prefix_state(true, false);
++                p.prefix_edge(thought_state, think_end_line, text_state);
++                p.prefix_edge(thought_state, think_end, text_state);
++                p.prefix_edge(thought_state, call_marker, text_state, true);
++                first_state = p.prefix_state(false, false, text_state);
++                p.prefix_edge(first_state, think_open, thought_state);
++            }
++            auto header_state = p.prefix_state(false, false);
++            p.prefix_edge(header_state, generation_prompt, first_state);
++            p.prefix_root(header_state);
++
+             auto arg_close  = p.tool_arg_close(p.literal("\n</parameter>\n"));
+             auto arg_string = p.rule("xml-arg-string",
+                 p.ac(p.tool_arg_string_value(p.until("\n</parameter>\n")) + arg_close, "\n</parameter>\n"));
+diff --git a/common/peg-parser.cpp b/common/peg-parser.cpp
+index e2ccb77..6bf3ac7 100644
+--- a/common/peg-parser.cpp
++++ b/common/peg-parser.cpp
+@@ -927,6 +927,18 @@ void common_peg_arena::resolve_refs() {
+     if (root_ != COMMON_PEG_INVALID_PARSER_ID) {
+         root_ = resolve_ref(root_);
+     }
++    std::map<common_peg_parser_id, std::string> resolved_semantics;
++    for (const auto & entry : semantics_) { resolved_semantics[resolve_ref(entry.first)] = entry.second; }
++    semantics_ = std::move(resolved_semantics);
++    for (auto & entry : value_codecs_) {
++        auto & codec = entry.second;
++        for (auto field : {&codec.value, &codec.open, &codec.close, &codec.separator, &codec.key, &codec.key_end}) {
++            if (*field != COMMON_PEG_INVALID_PARSER_ID) { *field = resolve_ref(*field); }
++        }
++    }
++    for (auto & state : prefix_states_) {
++        for (auto & edge : state.edges) { edge.marker = resolve_ref(edge.marker); }
++    }
+ }
+ 
+ std::string common_peg_arena::dump(common_peg_parser_id id) const {
+diff --git a/common/peg-parser.h b/common/peg-parser.h
+index 46df998..c843252 100644
+--- a/common/peg-parser.h
++++ b/common/peg-parser.h
+@@ -5,6 +5,7 @@
+ #include "llama.h"
+ 
+ #include <memory>
++#include <map>
+ #include <set>
+ #include <stdexcept>
+ #include <unordered_map>
+@@ -338,10 +339,38 @@ using common_peg_parser_variant = std::variant<
+     common_peg_ac_parser
+ >;
+ 
++struct common_peg_value_codec {
++    common_peg_parser_id value;
++    common_peg_parser_id open;
++    common_peg_parser_id close;
++    common_peg_parser_id separator = COMMON_PEG_INVALID_PARSER_ID;
++    common_peg_parser_id key = COMMON_PEG_INVALID_PARSER_ID;
++    common_peg_parser_id key_end = COMMON_PEG_INVALID_PARSER_ID;
++};
++
++struct common_peg_prefix_edge {
++    common_peg_parser_id marker;
++    size_t next;
++    bool replay = false;
++    bool tool = false;
++};
++
++struct common_peg_prefix_state {
++    bool scan;
++    bool complete;
++    size_t fallback = COMMON_PEG_INVALID_PARSER_ID;
++    std::vector<common_peg_prefix_edge> edges;
++    bool whitespace = false;
++};
++
+ class common_peg_arena {
+     std::vector<common_peg_parser_variant> parsers_;
+     std::unordered_map<std::string, common_peg_parser_id> rules_;
+     common_peg_parser_id root_ = COMMON_PEG_INVALID_PARSER_ID;
++    std::map<std::string, common_peg_value_codec> value_codecs_;
++    std::map<common_peg_parser_id, std::string> semantics_;
++    std::vector<common_peg_prefix_state> prefix_states_;
++    size_t prefix_root_ = COMMON_PEG_INVALID_PARSER_ID;
+ 
+   public:
+     const common_peg_parser_variant & get(common_peg_parser_id id) const { return parsers_.at(id); }
+@@ -366,6 +395,7 @@ class common_peg_arena {
+     std::string dump(common_peg_parser_id id) const;
+ 
+     friend class common_peg_parser_builder;
++    friend struct common_chat_tool_grammar;
+ 
+   private:
+     std::string dump_impl(common_peg_parser_id id, std::set<common_peg_parser_id> & visited) const;
+@@ -385,6 +415,28 @@ class common_peg_parser_builder {
+   public:
+     common_peg_parser_builder();
+ 
++    // Codec metadata references native nodes; semantic rules keep existing mapping tags.
++    common_peg_parser semantic(const common_peg_parser & p, const std::string & role) {
++        auto wrapped = rule("semantic-" + role + "-" + std::to_string(arena_.size()), p);
++        arena_.semantics_[wrapped.id()] = role;
++        return wrapped;
++    }
++    void value_codec(const std::string & kind, common_peg_value_codec codec) {
++        arena_.value_codecs_[kind] = codec;
++    }
++    size_t prefix_state(bool scan, bool complete, size_t fallback = COMMON_PEG_INVALID_PARSER_ID) {
++        arena_.prefix_states_.push_back({scan, complete, fallback, {}});
++        return arena_.prefix_states_.size() - 1;
++    }
++    void prefix_root(size_t state) { arena_.prefix_root_ = state; }
++    void prefix_whitespace(size_t state) { arena_.prefix_states_.at(state).whitespace = true; }
++    void prefix_edge(size_t from, const common_peg_parser & marker, size_t next, bool replay = false) {
++        arena_.prefix_states_.at(from).edges.push_back({marker.id(), next, replay, false});
++    }
++    void prefix_tool(size_t from, const common_peg_parser & marker) {
++        arena_.prefix_states_.at(from).edges.push_back({marker.id(), COMMON_PEG_INVALID_PARSER_ID, false, true});
++    }
++
+     // Match nothing, always succeed.
+     //   S -> ε
+     common_peg_parser eps() { return add(common_peg_epsilon_parser{}); }
 diff --git a/common/sampling.cpp b/common/sampling.cpp
 index 564fa9c..6b7ca67 100644
 --- a/common/sampling.cpp
@@ -694,9 +1519,20 @@ index 564fa9c..6b7ca67 100644
      GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
  
 diff --git a/src/llama-grammar.h b/src/llama-grammar.h
-index 2885f77..a9e5ad2 100644
+index 2885f77..fb7a38d 100644
 --- a/src/llama-grammar.h
 +++ b/src/llama-grammar.h
+@@ -69,8 +69,8 @@ using llama_grammar_stacks     = std::vector<llama_grammar_stack>;
+ using llama_grammar_candidates = std::vector<llama_grammar_candidate>;
+ 
+ // TODO: remove, needed for tests atm
+-const llama_grammar_rules  & llama_grammar_get_rules (const struct llama_grammar * grammar);
+-      llama_grammar_stacks & llama_grammar_get_stacks(      struct llama_grammar * grammar);
++LLAMA_API const llama_grammar_rules  & llama_grammar_get_rules (const struct llama_grammar * grammar);
++LLAMA_API llama_grammar_stacks & llama_grammar_get_stacks(      struct llama_grammar * grammar);
+ 
+ // takes a set of possible pushdown stacks on a grammar, which are required to
+ // be positioned at a character range (see `llama_grammar_advance_stack`), and
 @@ -83,7 +83,7 @@ std::vector<llama_grammar_candidate> llama_grammar_reject_candidates_for_stack(
          const llama_grammar_stack      & stack,
          const llama_grammar_candidates & candidates);
@@ -705,6 +1541,40 @@ index 2885f77..a9e5ad2 100644
 +struct LLAMA_API llama_grammar_parser {
      const llama_vocab * vocab;
      std::map<std::string, uint32_t> symbol_ids;
+ 
+@@ -157,13 +157,13 @@ struct llama_grammar {
+ //
+ 
+ // note: needed for tests (not great)
+-struct llama_grammar * llama_grammar_init_impl(
++LLAMA_API struct llama_grammar * llama_grammar_init_impl(
+         const struct llama_vocab * vocab,
+         const llama_grammar_element ** rules,
+         size_t n_rules,
+         size_t start_rule_index);
+ 
+-struct llama_grammar * llama_grammar_init_impl(
++LLAMA_API struct llama_grammar * llama_grammar_init_impl(
+         const struct llama_vocab * vocab,
+                       const char * grammar_str,
+                       const char * grammar_root,
+@@ -173,7 +173,7 @@ struct llama_grammar * llama_grammar_init_impl(
+                const llama_token * trigger_tokens,
+                             size_t num_trigger_tokens);
+ 
+-void llama_grammar_free_impl(struct llama_grammar * grammar);
++LLAMA_API void llama_grammar_free_impl(struct llama_grammar * grammar);
+ 
+ struct llama_grammar * llama_grammar_clone_impl(const struct llama_grammar & grammar);
+ 
+@@ -186,7 +186,7 @@ void llama_grammar_accept_impl(
+               struct llama_grammar & grammar,
+                        llama_token   token);
+ 
+-void llama_grammar_accept_str(
++LLAMA_API void llama_grammar_accept_str(
+               struct llama_grammar & grammar,
+                  const std::string & piece);
  
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
 index 4224a15..ec0b971 100644
@@ -722,14 +1592,15 @@ index 4224a15..ec0b971 100644
 +endif()
 diff --git a/tests/test-tool-input-grammar.cpp b/tests/test-tool-input-grammar.cpp
 new file mode 100644
-index 0000000..22320b1
+index 0000000..b64552a
 --- /dev/null
 +++ b/tests/test-tool-input-grammar.cpp
-@@ -0,0 +1,280 @@
+@@ -0,0 +1,342 @@
 +#ifdef NDEBUG
 +#undef NDEBUG
 +#endif
 +#include "chat.h"
++#include "chat-peg-parser.h"
 +#include "llguidance.h"
 +
 +#include <cassert>
@@ -782,7 +1653,11 @@ index 0000000..22320b1
 +        assert(llg_matcher_consume_token(m.get(), token) == 0);
 +        pos += length;
 +    }
-+    return llg_matcher_is_accepting(m.get());
++    const bool accepting = llg_matcher_is_accepting(m.get());
++    assert(llg_matcher_compute_mask(m.get()) == 0);
++    const auto * final_mask = llg_matcher_get_mask(m.get());
++    assert(bool(final_mask[256 / 32] & (1u << (256 % 32))) == accepting);
++    return accepting;
 +}
 +
 +static std::string body_grammar(const std::string & definition, const std::string & mode) {
@@ -819,12 +1694,11 @@ index 0000000..22320b1
 +    inputs.messages = {msg};
 +    inputs.tools = common_chat_tools_parse_oaicompat(tools);
 +    inputs.enable_thinking = thinking;
++    inputs.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
 +    inputs.tool_choice = none ? COMMON_CHAT_TOOL_CHOICE_NONE :
 +        (required ? COMMON_CHAT_TOOL_CHOICE_REQUIRED : COMMON_CHAT_TOOL_CHOICE_AUTO);
 +    inputs.parallel_tool_calls = parallel;
-+    std::ifstream descriptor("tests/runtime-tool-formats/" + profile + ".json");
-+    assert(descriptor.good());
-+    inputs.native_tool_format = read_json(descriptor);
++    (void) profile; // Profiles identify test cases only; the engine uses the native template.
 +    return common_chat_templates_apply(tmpl.get(), inputs);
 +}
 +
@@ -839,7 +1713,7 @@ index 0000000..22320b1
 +    const bool bytes = accepts(grammar(p), prefill + text);
 +    const bool compound = accepts(grammar(p), prefill + text, true);
 +    if (bytes != valid || compound != valid) {
-+        std::cerr << "Expected=" << valid << " byte=" << bytes << " compound=" << compound << "\n";
++        std::cerr << "Expected=" << valid << " byte=" << bytes << " compound=" << compound << " sample=" << json(text).dump() << "\n";
 +        accepts(grammar(p), prefill + text, false, true);
 +        accepts(grammar(p), prefill + text, true, true);
 +        throw std::runtime_error("unexpected acceptance: " + text + "\n" + grammar(p));
@@ -858,7 +1732,7 @@ index 0000000..22320b1
 +    assert(failed);
 +}
 +
-+int main() {
++static int test_main() {
 +    // A byte vocabulary exercises token masks without any model or tokenizer download.
 +    std::vector<uint32_t> lengths(257, 1);
 +    std::vector<uint8_t> bytes;
@@ -935,6 +1809,29 @@ index 0000000..22320b1
 +    assert(!(mask['\n' / 32] & (1u << ('\n' % 32))));
 +    assert(mask['B' / 32] & (1u << ('B' % 32)));
 +
++    // A nested trigger must not become an independent entry that skips its section.
++    {
++        common_chat_templates_inputs inputs;
++        inputs.tools = common_chat_tools_parse_oaicompat(json::array({tool("calculate", "start: \"A\"")}));
++        inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_REQUIRED;
++        common_chat_params data;
++        data.format = COMMON_CHAT_FORMAT_PEG_NATIVE;
++        data.parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
++            auto section = p.literal("[");
++            auto entry = p.prefix_state(false, false);
++            p.prefix_tool(entry, section);
++            p.prefix_root(entry);
++            auto call = p.tool(p.tool_open(p.tool_name(p.literal("calculate"))) +
++                p.tool_args(p.schema(p.json(), "args-schema", json::parse(inputs.tools[0].parameters))) + p.tool_close(p.literal("]")));
++            auto inner = p.trigger_rule("inner", p.literal("[call:") + call);
++            return p.trigger_rule("outer", section + inner + p.literal("]")) + p.end();
++        });
++        common_chat_apply_tool_grammars(data, inputs);
++        check(data, "[[call:calculate{\"input\":\"A\"}]]", true);
++        check(data, "[call:calculate{\"input\":\"A\"}]", false);
++        assert(parse(data, "[[call:calculate{\"input\":\"A\"}]]").tool_calls.size() == 1);
++    }
++
 +    std::ifstream cases_stream("tests/runtime-tool-formats/tests.json");
 +    assert(cases_stream.good());
 +    const auto cases = read_json(cases_stream);
@@ -942,13 +1839,17 @@ index 0000000..22320b1
 +        const std::string profile = entry.at("profile"), file = entry.at("template");
 +        const auto & tools = entry.at("tools");
 +        std::cerr << "Testing runtime format: " << profile << "\n";
-+        auto p = apply(file, tools, false, true, false, profile);
 +        if (entry.value("compile_error", false)) {
-+            auto failed = matcher(grammar(p));
-+            assert(llg_matcher_get_error(failed.get()));
++            expect_error([&] {
++                auto p = apply(file, tools, false, true, false, profile);
++                auto failed = matcher(grammar(p));
++                if (llg_matcher_get_error(failed.get())) { throw std::runtime_error(llg_matcher_get_error(failed.get())); }
++            });
 +            continue;
 +        }
-+        check(p, "Hello", true);
++        auto p = apply(file, tools, false, true, false, profile);
++        const auto answer = entry.value("answer", std::string("Hello"));
++        check(p, answer, true);
 +        for (const auto & sample : entry.at("accept")) {
 +            const std::string text = sample.at("text");
 +            check(p, text, true);
@@ -979,35 +1880,66 @@ index 0000000..22320b1
 +            }
 +            auto single = apply(file, tools, true, false, false, profile);
 +            check(single, text, true);
-+            check(single, "Hello", false);
++            check(single, answer, false);
 +            check(single, text + text, false);
 +            check(single, text.substr(0, text.size() - 1), false);
 +            expect_error([&] { parse(single, text.substr(0, text.size() - 1)); });
 +        }
++        if (entry.at("accept").size() > 1) {
++            const auto mixed = entry.at("accept").at(0).at("text").get<std::string>() + entry.at("accept").back().at("text").get<std::string>();
++            check(p, mixed, true);
++            assert(parse(p, mixed).tool_calls.size() == 2);
++        }
 +        for (const auto & rejected : entry.at("reject")) { check(p, rejected.get<std::string>(), false); }
 +        auto thinking = apply(file, tools, false, true, false, profile, true);
-+        std::ifstream descriptor("tests/runtime-tool-formats/" + profile + ".json");
-+        const auto spec = read_json(descriptor);
-+        const std::string start = spec.at("thinking_start"), end = spec.at("thinking_end").at(0);
-+        const std::string thought = (thinking.generation_prompt.find(start) == std::string::npos ? start : "") +
-+            "Analysis" + end + "Hello";
-+        check(thinking, thought, true);
-+        const auto thought_msg = parse(thinking, thought);
-+        assert(thought_msg.reasoning_content == "Analysis");
-+        assert(thought_msg.content == "Hello");
++        if (thinking.supports_thinking && !thinking.thinking_start_tag.empty() && !thinking.thinking_end_tags.empty()) {
++            const auto start = thinking.thinking_start_tag, end = thinking.thinking_end_tags.front();
++            const std::string thought = (thinking.generation_prompt.find(start) == std::string::npos ? start : "") +
++                "Analysis" + end + answer;
++            check(thinking, thought, true);
++            const auto thought_msg = parse(thinking, thought);
++            assert(thought_msg.reasoning_content == "Analysis");
++            assert(thought_msg.content == "Hello");
++            const auto call_text = entry.at("accept").at(0).at("text").get<std::string>();
++            bool tool_closes_thought = false;
++            for (const auto & marker : thinking.thinking_end_tags) { tool_closes_thought |= call_text.find(marker) == 0; }
++            if (!tool_closes_thought) {
++                const auto unclosed = (thinking.generation_prompt.find(start) == std::string::npos ? start : "") + std::string("Analysis") + call_text;
++                check(thinking, unclosed, false);
++            }
++        }
++        for (const auto & control : entry.value("control_cases", json::array())) {
++            auto control_params = apply(file, tools, control.value("required", false), true, false, profile, control.value("thinking", false));
++            const auto text = control.at("text").get<std::string>();
++            check(control_params, text, control.at("valid").get<bool>());
++            if (control.at("valid").get<bool>()) {
++                const auto message = parse(control_params, text);
++                assert(message.tool_calls.size() == control.at("calls").get<size_t>());
++                for (size_t i = 0; i < message.tool_calls.size(); ++i) {
++                    const auto & expected = control.at("expected").at(i);
++                    assert(message.tool_calls[i].name == expected.at("name").get<std::string>());
++                    assert(json::parse(message.tool_calls[i].arguments) == expected.at("arguments"));
++                }
++            }
++        }
 +        auto disabled = apply(file, tools, false, true, true, profile);
-+        check(disabled, "Hello", true);
-+        assert(parse(disabled, "Hello").tool_calls.empty());
++        assert(parse(disabled, answer).tool_calls.empty());
 +    }
-+    // No descriptor fallback for grammar tools: fail before unconstrained sampling.
++    // Invalid tool contracts fail before sampling.
 +    auto bad = tool("calculate", recursive);
 +    bad["function"]["parameters"]["required"] = json::array();
 +    expect_error([&] { common_chat_tools_parse_oaicompat(json::array({bad})); });
 +    llg_free_tokenizer(tokenizer);
-+    std::cout << "Runtime format tests passed (no model loaded).\n";
++    std::cout << "Native parser tool grammar tests passed (no model loaded).\n";
++    return 0;
++}
++
++int main() {
++    try { return test_main(); }
++    catch (const std::exception & e) { std::cerr << e.what() << "\n"; return 1; }
 +}
 diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
-index 311eb4f..55b1b3c 100644
+index 311eb4f..7fdabbe 100644
 --- a/tools/server/server-common.cpp
 +++ b/tools/server/server-common.cpp
 @@ -1357,7 +1357,21 @@ json oaicompat_chat_params_parse(
@@ -1033,26 +1965,27 @@ index 311eb4f..55b1b3c 100644
  
      if (!opt.use_jinja) {
          if (has_tools) {
-@@ -1443,6 +1457,7 @@ json oaicompat_chat_params_parse(
+@@ -1443,6 +1457,9 @@ json oaicompat_chat_params_parse(
      inputs.tool_choice            = common_chat_tool_choice_parse_oaicompat(tool_choice);
      inputs.json_schema            = json_schema.is_null() ? "" : json_schema.dump();
      inputs.grammar                = grammar;
-+    if (body.contains("native_tool_format")) { inputs.native_tool_format = body.at("native_tool_format"); }
++    if (body.contains("native_tool_format")) {
++        throw std::invalid_argument("native_tool_format is no longer accepted; the native parser owns the format");
++    }
      inputs.use_jinja              = opt.use_jinja;
      inputs.parallel_tool_calls    = json_value(body, "parallel_tool_calls", caps.at("supports_parallel_tool_calls").get<bool>());
      inputs.add_generation_prompt  = json_value(body, "add_generation_prompt", true);
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 48f1e93..6e97357 100644
+index 48f1e93..176c90e 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -5702,6 +5702,12 @@ static json get_res_props(const server_context_meta & meta, const common_params
+@@ -5702,6 +5702,11 @@ static json get_res_props(const server_context_meta & meta, const common_params
          { "cors_proxy_enabled",          params.ui_mcp_proxy },
      };
  
 +#ifdef LLAMA_USE_LLGUIDANCE
-+    props["native_tool_input_grammar"] = {{"version", 2}, {"syntax", "lark"},
-+        {"format_parameter", "native_tool_format"}, {"format_version", 1},
-+        {"runtime_formats", true}, {"encodings", json::array({"json_string", "raw"})}};
++    props["native_tool_input_grammar"] = {{"version", 3}, {"syntax", "lark"},
++        {"native_parser", true}, {"encodings", json::array({"json_string", "raw"})}};
 +#endif
 +
      if (!params.server_connect_code.empty()) {

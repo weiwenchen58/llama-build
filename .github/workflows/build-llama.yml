@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       native_tool_grammar:
-        description: Apply and test runtime format and per-tool grammar patches
+        description: Apply and test native parser per-tool grammar patches
         type: boolean
         default: true
   push:
@@ -64,6 +64,7 @@ jobs:
           git -C llama.cpp apply --check ../builder/patches/llama.cpp-tool-input-grammar.patch
           git -C llama.cpp apply ../builder/patches/llama.cpp-tool-input-grammar.patch
           cp -R builder/formats llama.cpp/tests/runtime-tool-formats
+          cp builder/formats/*.jinja llama.cpp/models/templates/
           cmake -S llama.cpp -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=OFF -DGGML_NATIVE=OFF \
@@ -73,9 +74,9 @@ jobs:
       - name: Build and run native tests without a model
         run: |
           set -euo pipefail
-          cmake --build build --parallel 2 --target test-tool-input-grammar test-peg-parser test-chat-peg-parser test-json-schema-to-grammar
+          cmake --build build --parallel 2 --target test-tool-input-grammar test-peg-parser test-chat-peg-parser test-chat-auto-parser test-json-schema-to-grammar
           ctest --test-dir build --output-on-failure --output-junit native-tests.xml \
-            -R '^(test-tool-input-grammar|test-peg-parser|test-chat-peg-parser|test-json-schema-to-grammar)$'
+            -R '^(test-tool-input-grammar|test-peg-parser|test-chat-peg-parser|test-chat-auto-parser|test-json-schema-to-grammar)$'
           cmake --build build --parallel 2 --target llama-server
       - name: Save CPU compiler cache
         if: always()
@@ -312,6 +313,8 @@ jobs:
             gpu_inference = 'not tested; this runner has no NVIDIA GPU'
             llguidance_inference = 'not tested; no model is downloaded'
             strict_grammar_failure = $(if ($env:NATIVE_TOOL_GRAMMAR -eq 'true') { 'sampler errors fail the request; real-model validation pending' } else { 'not guaranteed; unmodified upstream behavior' })
+            native_tool_grammar_version = 3
+            native_format_source = 'upstream parser, format metadata and mapper; no request format descriptor'
             native_tests = $(if ($env:NATIVE_TOOL_GRAMMAR -eq 'true') { 'passed in prerequisite CPU job; no model loaded' } else { 'not run' })
           }
           $manifest | ConvertTo-Json -Depth 5 | Set-Content package/build-info.json
@@ -341,7 +344,7 @@ jobs:
             "{0}  {1}" -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $relative
           } | Set-Content logs/package-SHA256SUMS.txt
           Copy-Item logs/package-SHA256SUMS.txt package/SHA256SUMS.txt
-          $variant = if ($env:NATIVE_TOOL_GRAMMAR -eq 'true') { '-runtime-formats' } else { '' }
+          $variant = if ($env:NATIVE_TOOL_GRAMMAR -eq 'true') { '-native-parser' } else { '' }
           $zipName = "llama-149f5641-win-x64-cuda13.0.2-llguidance$variant-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT.zip"
           Compress-Archive -Path package/* -DestinationPath "dist/$zipName" -CompressionLevel Optimal
           "{0}  {1}" -f (Get-FileHash "dist/$zipName" -Algorithm SHA256).Hash.ToLowerInvariant(), $zipName |

@@ -69,6 +69,74 @@
             "additionalProperties": false
           }
         }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "emit_label",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: \"<div>中文</div>\""
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "nested",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "config": {
+                "type": "object",
+                "properties": {
+                  "count": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "tags": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "ok"
+                      ]
+                    },
+                    "minItems": 1,
+                    "maxItems": 2
+                  }
+                },
+                "required": [
+                  "count",
+                  "tags"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "config"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "ping"
+        }
       }
     ],
     "accept": [
@@ -92,11 +160,61 @@
         "arguments": {
           "input": "(1+(2+3))"
         }
+      },
+      {
+        "name": "nested",
+        "arguments": {
+          "config": {
+            "count": 2,
+            "tags": [
+              "ok"
+            ]
+          }
+        },
+        "text": "<tool_call>\n{\"name\":\"nested\",\"arguments\":{\"config\":{\"count\":2,\"tags\":[\"ok\"]}}}\n</tool_call>"
+      },
+      {
+        "name": "emit_label",
+        "arguments": {
+          "input": "<div>中文</div>"
+        },
+        "text": "<tool_call>\n{\"name\":\"emit_label\",\"arguments\":{\"input\":\"<div>中文</div>\"}}\n</tool_call>"
+      },
+      {
+        "name": "ping",
+        "arguments": {},
+        "text": "<tool_call>\n{\"name\":\"ping\",\"arguments\":{}}\n</tool_call>"
       }
     ],
     "reject": [
       "<tool_call>\n{\"name\":\"calculate\",\"arguments\":{\"input\":\"(1*2)\"}}\n</tool_call>",
-      "<tool_call>\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"bad path\"}}\n</tool_call>"
+      "<tool_call>\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"bad path\"}}\n</tool_call>",
+      "<tool_call>\n{\"name\":\"calculate\",\"arguments\":{\"input\":\"<div>中文</div>\"}}\n</tool_call>",
+      "<tool_call>\n{\"name\":\"emit_label\",\"arguments\":{\"input\":\"(1+2)\"}}\n</tool_call>",
+      "<tool_call>\n{\"name\":\"nested\",\"arguments\":{\"config\":{\"count\":0,\"tags\":[\"ok\"]}}}\n</tool_call>",
+      "<tool_call>\n{\"name\":\"nested\",\"arguments\":{\"config\":{\"count\":2,\"tags\":[\"bad\"]}}}\n</tool_call>"
+    ],
+    "control_cases": [
+      {
+        "case": "mixed-independent-grammars",
+        "text": "<tool_call>\n{\"name\":\"calculate\",\"arguments\":{\"input\":\"(1+(2+3))\"}}\n</tool_call><tool_call>\n{\"name\":\"emit_label\",\"arguments\":{\"input\":\"<div>中文</div>\"}}\n</tool_call>",
+        "valid": true,
+        "calls": 2,
+        "expected": [
+          {
+            "name": "calculate",
+            "arguments": {
+              "input": "(1+(2+3))"
+            }
+          },
+          {
+            "name": "emit_label",
+            "arguments": {
+              "input": "<div>中文</div>"
+            }
+          }
+        ]
+      }
     ]
   },
   {
@@ -169,6 +287,74 @@
             "additionalProperties": false
           }
         }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "emit_label",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: \"<div>中文</div>\""
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "nested",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "config": {
+                "type": "object",
+                "properties": {
+                  "count": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "tags": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "ok"
+                      ]
+                    },
+                    "minItems": 1,
+                    "maxItems": 2
+                  }
+                },
+                "required": [
+                  "count",
+                  "tags"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "config"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "ping"
+        }
       }
     ],
     "accept": [
@@ -192,11 +378,61 @@
         "arguments": {
           "input": "(1+(2+3))"
         }
+      },
+      {
+        "name": "nested",
+        "arguments": {
+          "config": {
+            "count": 2,
+            "tags": [
+              "ok"
+            ]
+          }
+        },
+        "text": "<tool_call>\n<function=nested>\n<parameter=config>\n{\"count\":2,\"tags\":[\"ok\"]}\n</parameter>\n</function>\n</tool_call>"
+      },
+      {
+        "name": "emit_label",
+        "arguments": {
+          "input": "<div>中文</div>"
+        },
+        "text": "<tool_call>\n<function=emit_label>\n<parameter=input>\n<div>中文</div>\n</parameter>\n</function>\n</tool_call>"
+      },
+      {
+        "name": "ping",
+        "arguments": {},
+        "text": "<tool_call>\n<function=ping>\n</function>\n</tool_call>"
       }
     ],
     "reject": [
       "<tool_call>\n<function=calculate>\n<parameter=input>\n(1*2)\n</parameter>\n</function>\n</tool_call>",
-      "<tool_call>\n<function=read_file>\n<parameter=path>\nbad path\n</parameter>\n</function>\n</tool_call>"
+      "<tool_call>\n<function=read_file>\n<parameter=path>\nbad path\n</parameter>\n</function>\n</tool_call>",
+      "<tool_call>\n<function=calculate>\n<parameter=input>\n<div>中文</div>\n</parameter>\n</function>\n</tool_call>",
+      "<tool_call>\n<function=emit_label>\n<parameter=input>\n(1+2)\n</parameter>\n</function>\n</tool_call>",
+      "<tool_call>\n<function=nested>\n<parameter=config>\n{\"count\":0,\"tags\":[\"ok\"]}\n</parameter>\n</function>\n</tool_call>",
+      "<tool_call>\n<function=nested>\n<parameter=config>\n{\"count\":2,\"tags\":[\"bad\"]}\n</parameter>\n</function>\n</tool_call>"
+    ],
+    "control_cases": [
+      {
+        "case": "mixed-independent-grammars",
+        "text": "<tool_call>\n<function=calculate>\n<parameter=input>\n(1+(2+3))\n</parameter>\n</function>\n</tool_call><tool_call>\n<function=emit_label>\n<parameter=input>\n<div>中文</div>\n</parameter>\n</function>\n</tool_call>",
+        "valid": true,
+        "calls": 2,
+        "expected": [
+          {
+            "name": "calculate",
+            "arguments": {
+              "input": "(1+(2+3))"
+            }
+          },
+          {
+            "name": "emit_label",
+            "arguments": {
+              "input": "<div>中文</div>"
+            }
+          }
+        ]
+      }
     ]
   },
   {
@@ -269,6 +505,74 @@
             "additionalProperties": false
           }
         }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "emit_label",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: \"<div>中文</div>\""
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "nested",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "config": {
+                "type": "object",
+                "properties": {
+                  "count": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "tags": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "ok"
+                      ]
+                    },
+                    "minItems": 1,
+                    "maxItems": 2
+                  }
+                },
+                "required": [
+                  "count",
+                  "tags"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "config"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "ping"
+        }
       }
     ],
     "accept": [
@@ -292,11 +596,112 @@
         "arguments": {
           "input": "(1+(2+3))"
         }
+      },
+      {
+        "name": "nested",
+        "arguments": {
+          "config": {
+            "count": 2,
+            "tags": [
+              "ok"
+            ]
+          }
+        },
+        "text": "<function name=\"nested\"><param name=\"config\">{\"count\":2,\"tags\":[\"ok\"]}</param></function>"
+      },
+      {
+        "name": "emit_label",
+        "arguments": {
+          "input": "<div>中文</div>"
+        },
+        "text": "<function name=\"emit_label\"><param name=\"input\"><![CDATA[<div>中文</div>]]></param></function>"
+      },
+      {
+        "name": "ping",
+        "arguments": {},
+        "text": "<function name=\"ping\"></function>"
       }
     ],
     "reject": [
       "<function name=\"calculate\"><param name=\"input\"><![CDATA[(1*2)]]></param></function>",
-      "<function name=\"read_file\"><param name=\"path\"><![CDATA[bad path]]></param></function>"
+      "<function name=\"read_file\"><param name=\"path\"><![CDATA[bad path]]></param></function>",
+      "<function name=\"calculate\"><param name=\"input\"><![CDATA[<div>中文</div>]]></param></function>",
+      "<function name=\"emit_label\"><param name=\"input\"><![CDATA[(1+2)]]></param></function>",
+      "<function name=\"nested\"><param name=\"config\">{\"count\":0,\"tags\":[\"ok\"]}</param></function>",
+      "<function name=\"nested\"><param name=\"config\">{\"count\":2,\"tags\":[\"bad\"]}</param></function>"
+    ],
+    "control_cases": [
+      {
+        "thinking": true,
+        "required": true,
+        "text": "Analysis<function name=\"calculate\"><param name=\"input\"><![CDATA[(1+(2+3))]]></param></function>",
+        "valid": false
+      },
+      {
+        "thinking": true,
+        "required": true,
+        "text": "Analysis</think><function name=\"calculate\"><param name=\"input\"><![CDATA[(1+(2+3))]]></param></function>",
+        "valid": true,
+        "calls": 1,
+        "expected": [
+          {
+            "name": "calculate",
+            "arguments": {
+              "input": "(1+(2+3))"
+            }
+          }
+        ]
+      },
+      {
+        "thinking": true,
+        "text": "<function name=\"calculate\"><param name=\"input\"><![CDATA[(1*2)]]></param></function></think><function name=\"calculate\"><param name=\"input\"><![CDATA[(1+(2+3))]]></param></function>",
+        "valid": true,
+        "calls": 1,
+        "expected": [
+          {
+            "name": "calculate",
+            "arguments": {
+              "input": "(1+(2+3))"
+            }
+          }
+        ]
+      },
+      {
+        "thinking": true,
+        "text": "<function name=\"calculate\"><param name=\"input\"><![CDATA[(1*2)]]></param></function></think>Hello",
+        "valid": true,
+        "calls": 0
+      },
+      {
+        "thinking": true,
+        "required": true,
+        "text": "<function name=\"calculate\"><param name=\"input\"><![CDATA[(1*2)]]></param></function></think>Hello",
+        "valid": false
+      },
+      {
+        "text": "<think>\n<function name=\"calculate\"><param name=\"input\"><![CDATA[(1*2)]]></param></function></think><function name=\"calculate\"><param name=\"input\"><![CDATA[(1+(2+3))]]></param></function>",
+        "valid": false
+      },
+      {
+        "case": "mixed-independent-grammars",
+        "text": "<function name=\"calculate\"><param name=\"input\"><![CDATA[(1+(2+3))]]></param></function><function name=\"emit_label\"><param name=\"input\"><![CDATA[<div>中文</div>]]></param></function>",
+        "valid": true,
+        "calls": 2,
+        "expected": [
+          {
+            "name": "calculate",
+            "arguments": {
+              "input": "(1+(2+3))"
+            }
+          },
+          {
+            "name": "emit_label",
+            "arguments": {
+              "input": "<div>中文</div>"
+            }
+          }
+        ]
+      }
     ]
   },
   {
@@ -369,6 +774,74 @@
             "additionalProperties": false
           }
         }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "emit_label",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: \"<div>中文</div>\""
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "nested",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "config": {
+                "type": "object",
+                "properties": {
+                  "count": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "tags": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "ok"
+                      ]
+                    },
+                    "minItems": 1,
+                    "maxItems": 2
+                  }
+                },
+                "required": [
+                  "count",
+                  "tags"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "config"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "ping"
+        }
       }
     ],
     "accept": [
@@ -392,16 +865,162 @@
         "arguments": {
           "input": "(1+(2+3))"
         }
+      },
+      {
+        "name": "nested",
+        "arguments": {
+          "config": {
+            "count": 2,
+            "tags": [
+              "ok"
+            ]
+          }
+        },
+        "text": "<|tool_call>call:nested{config:{count:2,tags:[<|\"|>ok<|\"|>]}}<tool_call|>"
+      },
+      {
+        "name": "emit_label",
+        "arguments": {
+          "input": "<div>中文</div>"
+        },
+        "text": "<|tool_call>call:emit_label{input:<|\"|><div>中文</div><|\"|>}<tool_call|>"
+      },
+      {
+        "name": "ping",
+        "arguments": {},
+        "text": "<|tool_call>call:ping{}<tool_call|>"
       }
     ],
     "reject": [
       "<|tool_call>call:calculate{input:<|\"|>(1*2)<|\"|>}<tool_call|>",
-      "<|tool_call>call:read_file{path:<|\"|>bad path<|\"|>}<tool_call|>"
+      "<|tool_call>call:read_file{path:<|\"|>bad path<|\"|>}<tool_call|>",
+      "<|tool_call>call:calculate{input:<|\"|><div>中文</div><|\"|>}<tool_call|>",
+      "<|tool_call>call:emit_label{input:<|\"|>(1+2)<|\"|>}<tool_call|>",
+      "<|tool_call>call:nested{config:{count:0,tags:[<|\"|>ok<|\"|>]}}<tool_call|>",
+      "<|tool_call>call:nested{config:{count:2,tags:[<|\"|>bad<|\"|>]}}<tool_call|>"
+    ],
+    "control_cases": [
+      {
+        "thinking": true,
+        "required": true,
+        "text": "<|channel>thought\nAnalysis<|tool_call>call:calculate{input:<|\"|>(1+(2+3))<|\"|>}<tool_call|>",
+        "valid": false
+      },
+      {
+        "thinking": true,
+        "required": true,
+        "text": "<|channel>thought\nAnalysis<channel|><|tool_call>call:calculate{input:<|\"|>(1+(2+3))<|\"|>}<tool_call|>",
+        "valid": true,
+        "calls": 1,
+        "expected": [
+          {
+            "name": "calculate",
+            "arguments": {
+              "input": "(1+(2+3))"
+            }
+          }
+        ]
+      },
+      {
+        "thinking": true,
+        "text": "<|channel>thought\n<|tool_call>call:calculate{input:<|\"|>(1*2)<|\"|>}<tool_call|><channel|><|tool_call>call:calculate{input:<|\"|>(1+(2+3))<|\"|>}<tool_call|>",
+        "valid": true,
+        "calls": 1,
+        "expected": [
+          {
+            "name": "calculate",
+            "arguments": {
+              "input": "(1+(2+3))"
+            }
+          }
+        ]
+      },
+      {
+        "thinking": true,
+        "text": "<|channel>thought\n<|tool_call>call:calculate{input:<|\"|>(1*2)<|\"|>}<tool_call|><channel|>Hello",
+        "valid": true,
+        "calls": 0
+      },
+      {
+        "thinking": true,
+        "required": true,
+        "text": "<|channel>thought\n<|tool_call>call:calculate{input:<|\"|>(1*2)<|\"|>}<tool_call|><channel|>Hello",
+        "valid": false
+      },
+      {
+        "required": true,
+        "text": "Hello<|tool_call>call:calculate{input:<|\"|>(1+(2+3))<|\"|>}<tool_call|>",
+        "valid": false
+      },
+      {
+        "text": "content<|channel>thought\n<|tool_call>call:calculate{input:<|\"|>(1*2)<|\"|>}<tool_call|><channel|><|tool_call>call:calculate{input:<|\"|>(1+(2+3))<|\"|>}<tool_call|>",
+        "valid": true,
+        "calls": 1,
+        "expected": [
+          {
+            "name": "calculate",
+            "arguments": {
+              "input": "(1+(2+3))"
+            }
+          }
+        ]
+      },
+      {
+        "text": "<|channel><|channel>thought\nAnalysis<channel|><|tool_call>call:calculate{input:<|\"|>(1+(2+3))<|\"|>}<tool_call|>",
+        "valid": true,
+        "calls": 1,
+        "expected": [
+          {
+            "name": "calculate",
+            "arguments": {
+              "input": "(1+(2+3))"
+            }
+          }
+        ]
+      },
+      {
+        "text": "<|channel>bogus <|tool_call>call:calculate{input:<|\"|>(1+(2+3))<|\"|>}<tool_call|>",
+        "valid": true,
+        "calls": 1,
+        "expected": [
+          {
+            "name": "calculate",
+            "arguments": {
+              "input": "(1+(2+3))"
+            }
+          }
+        ]
+      },
+      {
+        "required": true,
+        "text": "<|channel>bogus <|tool_call>call:calculate{input:<|\"|>(1+(2+3))<|\"|>}<tool_call|>",
+        "valid": false
+      },
+      {
+        "case": "mixed-independent-grammars",
+        "text": "<|tool_call>call:calculate{input:<|\"|>(1+(2+3))<|\"|>}<tool_call|><|tool_call>call:emit_label{input:<|\"|><div>中文</div><|\"|>}<tool_call|>",
+        "valid": true,
+        "calls": 2,
+        "expected": [
+          {
+            "name": "calculate",
+            "arguments": {
+              "input": "(1+(2+3))"
+            }
+          },
+          {
+            "name": "emit_label",
+            "arguments": {
+              "input": "<div>中文</div>"
+            }
+          }
+        ]
+      }
     ]
   },
   {
     "profile": "example-new-format",
-    "template": "Qwen-Qwen2.5-7B-Instruct.jinja",
+    "template": "runtime-new-format.jinja",
     "tools": [
       {
         "type": "function",
@@ -469,34 +1088,152 @@
             "additionalProperties": false
           }
         }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "emit_label",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: \"<div>中文</div>\""
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "nested",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "config": {
+                "type": "object",
+                "properties": {
+                  "count": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "tags": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "ok"
+                      ]
+                    },
+                    "minItems": 1,
+                    "maxItems": 2
+                  }
+                },
+                "required": [
+                  "count",
+                  "tags"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "config"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "ping"
+        }
       }
     ],
     "accept": [
       {
-        "text": "[[call:calculate]]\n{\"input\":\"(1+(2+3))\"}\n[[end]]",
+        "text": "<audit_call>\n{\"name\":\"calculate\",\"arguments\":{\"input\":\"(1+(2+3))\"}}\n</audit_call>",
         "name": "calculate",
         "arguments": {
           "input": "(1+(2+3))"
         }
       },
       {
-        "text": "[[call:read_file]]\n{\"path\":\"README.md\"}\n[[end]]",
+        "text": "<audit_call>\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"README.md\"}}\n</audit_call>",
         "name": "read_file",
         "arguments": {
           "path": "README.md"
         }
       },
       {
-        "text": "[[call:calculate_more]]\n{\"input\":\"(1+(2+3))\"}\n[[end]]",
+        "text": "<audit_call>\n{\"name\":\"calculate_more\",\"arguments\":{\"input\":\"(1+(2+3))\"}}\n</audit_call>",
         "name": "calculate_more",
         "arguments": {
           "input": "(1+(2+3))"
         }
+      },
+      {
+        "name": "nested",
+        "arguments": {
+          "config": {
+            "count": 2,
+            "tags": [
+              "ok"
+            ]
+          }
+        },
+        "text": "<audit_call>\n{\"name\":\"nested\",\"arguments\":{\"config\":{\"count\":2,\"tags\":[\"ok\"]}}}\n</audit_call>"
+      },
+      {
+        "name": "emit_label",
+        "arguments": {
+          "input": "<div>中文</div>"
+        },
+        "text": "<audit_call>\n{\"name\":\"emit_label\",\"arguments\":{\"input\":\"<div>中文</div>\"}}\n</audit_call>"
+      },
+      {
+        "name": "ping",
+        "arguments": {},
+        "text": "<audit_call>\n{\"name\":\"ping\",\"arguments\":{}}\n</audit_call>"
       }
     ],
     "reject": [
-      "[[call:calculate]]\n{\"input\":\"(1*2)\"}\n[[end]]",
-      "[[call:read_file]]\n{\"path\":\"bad path\"}\n[[end]]"
+      "<audit_call>\n{\"name\":\"calculate\",\"arguments\":{\"input\":\"(1*2)\"}}\n</audit_call>",
+      "<audit_call>\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"bad path\"}}\n</audit_call>",
+      "<audit_call>\n{\"name\":\"calculate\",\"arguments\":{\"input\":\"<div>中文</div>\"}}\n</audit_call>",
+      "<audit_call>\n{\"name\":\"emit_label\",\"arguments\":{\"input\":\"(1+2)\"}}\n</audit_call>",
+      "<audit_call>\n{\"name\":\"nested\",\"arguments\":{\"config\":{\"count\":0,\"tags\":[\"ok\"]}}}\n</audit_call>",
+      "<audit_call>\n{\"name\":\"nested\",\"arguments\":{\"config\":{\"count\":2,\"tags\":[\"bad\"]}}}\n</audit_call>"
+    ],
+    "control_cases": [
+      {
+        "case": "mixed-independent-grammars",
+        "text": "<audit_call>\n{\"name\":\"calculate\",\"arguments\":{\"input\":\"(1+(2+3))\"}}\n</audit_call><audit_call>\n{\"name\":\"emit_label\",\"arguments\":{\"input\":\"<div>中文</div>\"}}\n</audit_call>",
+        "valid": true,
+        "calls": 2,
+        "expected": [
+          {
+            "name": "calculate",
+            "arguments": {
+              "input": "(1+(2+3))"
+            }
+          },
+          {
+            "name": "emit_label",
+            "arguments": {
+              "input": "<div>中文</div>"
+            }
+          }
+        ]
+      }
     ]
   },
   {
@@ -612,7 +1349,7 @@
   },
   {
     "profile": "example-new-format",
-    "template": "Qwen-Qwen2.5-7B-Instruct.jinja",
+    "template": "runtime-new-format.jinja",
     "tools": [
       {
         "type": "function",
@@ -640,7 +1377,7 @@
     ],
     "accept": [
       {
-        "text": "[[call:apply_patch]]\n{\"input\":\"*** Begin Patch\\n*** Delete File: dir<part>.txt\\n*** End Patch\"}\n[[end]]",
+        "text": "<audit_call>\n{\"name\":\"apply_patch\",\"arguments\":{\"input\":\"*** Begin Patch\\n*** Delete File: dir<part>.txt\\n*** End Patch\"}}\n</audit_call>",
         "name": "apply_patch",
         "arguments": {
           "input": "*** Begin Patch\n*** Delete File: dir<part>.txt\n*** End Patch"
@@ -726,5 +1463,762 @@
       }
     ],
     "reject": []
+  },
+  {
+    "profile": "qwen-coder",
+    "template": "Qwen3-Coder.jinja",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "calculate",
+          "description": "calculate",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: expr\nexpr: NUMBER | \"(\" expr \"+\" expr \")\"\nNUMBER: /[0-9]+/\n%ignore /[ ]+/"
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "note": {
+                "type": "string",
+                "enum": [
+                  "x"
+                ]
+              },
+              "path": {
+                "type": "string",
+                "enum": [
+                  "README.md"
+                ]
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    ],
+    "accept": [
+      {
+        "name": "read_file",
+        "arguments": {
+          "path": "README.md",
+          "note": "x"
+        },
+        "text": "<tool_call>\n<function=read_file>\n<parameter=path>\nREADME.md\n</parameter>\n<parameter=note>\nx\n</parameter>\n</function>\n</tool_call>"
+      }
+    ],
+    "reject": [
+      "<tool_call>\n<function=read_file>\n<parameter=note>\nx\n</parameter>\n<parameter=path>\nREADME.md\n</parameter>\n</function>\n</tool_call>"
+    ],
+    "note": "optional-before-required regression"
+  },
+  {
+    "profile": "qwen-coder",
+    "template": "Qwen3-Coder.jinja",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "calculate",
+          "description": "calculate",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: expr\nexpr: NUMBER | \"(\" expr \"+\" expr \")\"\nNUMBER: /[0-9]+/\n%ignore /[ ]+/"
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "bad_key",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              " path": {
+                "type": "string",
+                "enum": [
+                  "x"
+                ]
+              }
+            },
+            "required": [
+              " path"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    ],
+    "accept": [],
+    "reject": [],
+    "compile_error": true,
+    "note": "Reject native mapper property-name normalization"
+  },
+  {
+    "profile": "minicpm5-cdata",
+    "template": "openbmb-MiniCPM5-1B.jinja",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "calculate",
+          "description": "calculate",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: expr\nexpr: NUMBER | \"(\" expr \"+\" expr \")\"\nNUMBER: /[0-9]+/\n%ignore /[ ]+/"
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "bad_key",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              " path": {
+                "type": "string",
+                "enum": [
+                  "x"
+                ]
+              }
+            },
+            "required": [
+              " path"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    ],
+    "accept": [],
+    "reject": [],
+    "compile_error": true,
+    "note": "Reject native mapper property-name normalization"
+  },
+  {
+    "profile": "gemma4-scalars",
+    "template": "google-gemma-4-31B-it.jinja",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "calculate",
+          "description": "calculate",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: expr\nexpr: NUMBER | \"(\" expr \"+\" expr \")\"\nNUMBER: /[0-9]+/\n%ignore /[ ]+/"
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "bad_key",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              " path": {
+                "type": "string",
+                "enum": [
+                  "x"
+                ]
+              }
+            },
+            "required": [
+              " path"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    ],
+    "accept": [],
+    "reject": [],
+    "compile_error": true,
+    "note": "Reject native mapper property-name normalization"
+  },
+  {
+    "profile": "qwen35-native",
+    "template": "Qwen3.5-4B.jinja",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "calculate",
+          "description": "calculate",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: expr\nexpr: NUMBER | \"(\" expr \"+\" expr \")\"\nNUMBER: /[0-9]+/\n%ignore /[ ]+/"
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "calculate_more",
+          "description": "calculate",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: expr\nexpr: NUMBER | \"(\" expr \"+\" expr \")\"\nNUMBER: /[0-9]+/\n%ignore /[ ]+/"
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "read_file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_.-]+$",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "emit_label",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: \"<div>中文</div>\""
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "nested",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "config": {
+                "type": "object",
+                "properties": {
+                  "count": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "tags": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "ok"
+                      ]
+                    },
+                    "minItems": 1,
+                    "maxItems": 2
+                  }
+                },
+                "required": [
+                  "count",
+                  "tags"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "config"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    ],
+    "accept": [
+      {
+        "text": "<tool_call>\n<function=calculate>\n<parameter=input>\n(1+(2+3))\n</parameter>\n</function>\n</tool_call>",
+        "name": "calculate",
+        "arguments": {
+          "input": "(1+(2+3))"
+        }
+      },
+      {
+        "text": "<tool_call>\n<function=read_file>\n<parameter=path>\nREADME.md\n</parameter>\n</function>\n</tool_call>",
+        "name": "read_file",
+        "arguments": {
+          "path": "README.md"
+        }
+      },
+      {
+        "text": "<tool_call>\n<function=calculate_more>\n<parameter=input>\n(1+(2+3))\n</parameter>\n</function>\n</tool_call>",
+        "name": "calculate_more",
+        "arguments": {
+          "input": "(1+(2+3))"
+        }
+      },
+      {
+        "name": "nested",
+        "arguments": {
+          "config": {
+            "count": 2,
+            "tags": [
+              "ok"
+            ]
+          }
+        },
+        "text": "<tool_call>\n<function=nested>\n<parameter=config>\n{\"count\":2,\"tags\":[\"ok\"]}\n</parameter>\n</function>\n</tool_call>"
+      },
+      {
+        "name": "emit_label",
+        "arguments": {
+          "input": "<div>中文</div>"
+        },
+        "text": "<tool_call>\n<function=emit_label>\n<parameter=input>\n<div>中文</div>\n</parameter>\n</function>\n</tool_call>"
+      }
+    ],
+    "reject": [
+      "<tool_call>\n<function=calculate>\n<parameter=input>\n(1*2)\n</parameter>\n</function>\n</tool_call>",
+      "<tool_call>\n<function=read_file>\n<parameter=path>\nbad path\n</parameter>\n</function>\n</tool_call>",
+      "<tool_call>\n<function=calculate>\n<parameter=input>\n<div>中文</div>\n</parameter>\n</function>\n</tool_call>",
+      "<tool_call>\n<function=emit_label>\n<parameter=input>\n(1+2)\n</parameter>\n</function>\n</tool_call>",
+      "<tool_call>\n<function=nested>\n<parameter=config>\n{\"count\":0,\"tags\":[\"ok\"]}\n</parameter>\n</function>\n</tool_call>",
+      "<tool_call>\n<function=nested>\n<parameter=config>\n{\"count\":2,\"tags\":[\"bad\"]}\n</parameter>\n</function>\n</tool_call>"
+    ],
+    "control_cases": [
+      {
+        "thinking": true,
+        "text": "Analysis<tool_call>\n<function=calculate>\n<parameter=input>\n(1+(2+3))\n</parameter>\n</function>\n</tool_call>",
+        "valid": true,
+        "calls": 1,
+        "expected": [
+          {
+            "name": "calculate",
+            "arguments": {
+              "input": "(1+(2+3))"
+            }
+          }
+        ]
+      },
+      {
+        "thinking": true,
+        "required": true,
+        "text": "Analysis<tool_call>\n<function=calculate>\n<parameter=input>\n(1+(2+3))\n</parameter>\n</function>\n</tool_call>",
+        "valid": true,
+        "calls": 1,
+        "expected": [
+          {
+            "name": "calculate",
+            "arguments": {
+              "input": "(1+(2+3))"
+            }
+          }
+        ]
+      },
+      {
+        "thinking": true,
+        "text": "Analysis<tool_call>\n<function=calculate>\n<parameter=input>\n(1*2)\n</parameter>\n</function>\n</tool_call>",
+        "valid": false
+      },
+      {
+        "thinking": true,
+        "text": "Analysis\n</think>\ntext<think><tool_call>\n<function=calculate>\n<parameter=input>\n(1*2)\n</parameter>\n</function>\n</tool_call>",
+        "valid": false
+      },
+      {
+        "thinking": true,
+        "text": "Analysis\n</think>\ntext<think><tool_call>\n<function=calculate>\n<parameter=input>\n(1+(2+3))\n</parameter>\n</function>\n</tool_call>",
+        "valid": true,
+        "calls": 1,
+        "expected": [
+          {
+            "name": "calculate",
+            "arguments": {
+              "input": "(1+(2+3))"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "profile": "invalid-object-schema",
+    "template": "Qwen-Qwen2.5-7B-Instruct.jinja",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "calculate",
+          "description": "calculate",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: expr\nexpr: NUMBER | \"(\" expr \"+\" expr \")\"\nNUMBER: /[0-9]+/\n%ignore /[ ]+/"
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "bad",
+          "parameters": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    ],
+    "accept": [],
+    "reject": [],
+    "compile_error": true
+  },
+  {
+    "profile": "wrapped-data-only",
+    "template": "runtime-wrapped-format.jinja",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "calculate",
+          "description": "calculate",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: expr\nexpr: NUMBER | \"(\" expr \"+\" expr \")\"\nNUMBER: /[0-9]+/\n%ignore /[ ]+/"
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "calculate_more",
+          "description": "calculate",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: expr\nexpr: NUMBER | \"(\" expr \"+\" expr \")\"\nNUMBER: /[0-9]+/\n%ignore /[ ]+/"
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "read_file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_.-]+$",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "emit_label",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: \"<div>中文</div>\""
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "nested",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "config": {
+                "type": "object",
+                "properties": {
+                  "count": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "tags": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "ok"
+                      ]
+                    },
+                    "minItems": 1,
+                    "maxItems": 2
+                  }
+                },
+                "required": [
+                  "count",
+                  "tags"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "config"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "ping"
+        }
+      }
+    ],
+    "accept": [
+      {
+        "text": "<wrapped_call>\n{\"name\":\"calculate\",\"arguments\":{\"input\":\"(1+(2+3))\"}}\n</wrapped_call>",
+        "name": "calculate",
+        "arguments": {
+          "input": "(1+(2+3))"
+        }
+      },
+      {
+        "text": "<wrapped_call>\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"README.md\"}}\n</wrapped_call>",
+        "name": "read_file",
+        "arguments": {
+          "path": "README.md"
+        }
+      },
+      {
+        "text": "<wrapped_call>\n{\"name\":\"calculate_more\",\"arguments\":{\"input\":\"(1+(2+3))\"}}\n</wrapped_call>",
+        "name": "calculate_more",
+        "arguments": {
+          "input": "(1+(2+3))"
+        }
+      },
+      {
+        "name": "nested",
+        "arguments": {
+          "config": {
+            "count": 2,
+            "tags": [
+              "ok"
+            ]
+          }
+        },
+        "text": "<wrapped_call>\n{\"name\":\"nested\",\"arguments\":{\"config\":{\"count\":2,\"tags\":[\"ok\"]}}}\n</wrapped_call>"
+      },
+      {
+        "name": "emit_label",
+        "arguments": {
+          "input": "<div>中文</div>"
+        },
+        "text": "<wrapped_call>\n{\"name\":\"emit_label\",\"arguments\":{\"input\":\"<div>中文</div>\"}}\n</wrapped_call>"
+      },
+      {
+        "name": "ping",
+        "arguments": {},
+        "text": "<wrapped_call>\n{\"name\":\"ping\",\"arguments\":{}}\n</wrapped_call>"
+      }
+    ],
+    "reject": [
+      "<wrapped_call>\n{\"name\":\"calculate\",\"arguments\":{\"input\":\"(1*2)\"}}\n</wrapped_call>",
+      "<wrapped_call>\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"bad path\"}}\n</wrapped_call>",
+      "<wrapped_call>\n{\"name\":\"calculate\",\"arguments\":{\"input\":\"<div>中文</div>\"}}\n</wrapped_call>",
+      "<wrapped_call>\n{\"name\":\"emit_label\",\"arguments\":{\"input\":\"(1+2)\"}}\n</wrapped_call>",
+      "<wrapped_call>\n{\"name\":\"nested\",\"arguments\":{\"config\":{\"count\":0,\"tags\":[\"ok\"]}}}\n</wrapped_call>",
+      "<wrapped_call>\n{\"name\":\"nested\",\"arguments\":{\"config\":{\"count\":2,\"tags\":[\"bad\"]}}}\n</wrapped_call>"
+    ],
+    "control_cases": [
+      {
+        "case": "mixed-independent-grammars",
+        "text": "<wrapped_call>\n{\"name\":\"calculate\",\"arguments\":{\"input\":\"(1+(2+3))\"}}\n</wrapped_call><wrapped_call>\n{\"name\":\"emit_label\",\"arguments\":{\"input\":\"<div>中文</div>\"}}\n</wrapped_call>",
+        "valid": true,
+        "calls": 2,
+        "expected": [
+          {
+            "name": "calculate",
+            "arguments": {
+              "input": "(1+(2+3))"
+            }
+          },
+          {
+            "name": "emit_label",
+            "arguments": {
+              "input": "<div>中文</div>"
+            }
+          }
+        ]
+      },
+      {
+        "text": "<answer><wrapped_call>\n{\"name\":\"calculate\",\"arguments\":{\"input\":\"(1*2)\"}}\n</wrapped_call></answer><wrapped_call>\n{\"name\":\"calculate\",\"arguments\":{\"input\":\"(1+(2+3))\"}}\n</wrapped_call>",
+        "valid": true,
+        "calls": 1,
+        "expected": [
+          {
+            "name": "calculate",
+            "arguments": {
+              "input": "(1+(2+3))"
+            }
+          }
+        ]
+      },
+      {
+        "text": "<answer><wrapped_call>\n{\"name\":\"calculate\",\"arguments\":{\"input\":\"(1*2)\"}}\n</wrapped_call></answer>",
+        "valid": true,
+        "calls": 0
+      },
+      {
+        "text": "Hello<wrapped_call>\n{\"name\":\"calculate\",\"arguments\":{\"input\":\"(1+(2+3))\"}}\n</wrapped_call>",
+        "valid": false
+      }
+    ],
+    "answer": "<answer>Hello</answer>"
   }
 ]
