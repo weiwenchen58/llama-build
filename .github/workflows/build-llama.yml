@@ -20,7 +20,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: build-llama-${{ github.ref }}
+  group: build-llama-native-parser-${{ github.ref }}
   cancel-in-progress: ${{ github.ref == 'refs/heads/codex/runtime-tool-formats' }}
 
 env:
@@ -98,7 +98,7 @@ jobs:
 
   build:
     needs: native-tests
-    if: always() && (needs.native-tests.result == 'success' || needs.native-tests.result == 'skipped')
+    if: ${{ !cancelled() && (needs.native-tests.result == 'success' || needs.native-tests.result == 'skipped') }}
     runs-on: windows-2022
     timeout-minutes: 240
     defaults:
