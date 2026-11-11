@@ -605,16 +605,10 @@
         }
       }
     ],
-    "accept": [
-      {
-        "text": "<function name=\"apply_patch\"><param name=\"input\"><![CDATA[*** Begin Patch\n*** Delete File: dir<part>.txt\n*** End Patch]]></param></function>",
-        "name": "apply_patch",
-        "arguments": {
-          "input": "*** Begin Patch\n*** Delete File: dir<part>.txt\n*** End Patch"
-        }
-      }
-    ],
-    "reject": []
+    "accept": [],
+    "reject": [],
+    "compile_error": true,
+    "note": "The full PATH language can contain ]]>; raw CDATA must reject rather than narrow it."
   },
   {
     "profile": "example-new-format",

@@ -59,10 +59,10 @@ index 114fa04..649c45d 100644
  
 diff --git a/common/chat-tool-grammar.cpp b/common/chat-tool-grammar.cpp
 new file mode 100644
-index 0000000..ccec1e8
+index 0000000..cedb14d
 --- /dev/null
 +++ b/common/chat-tool-grammar.cpp
-@@ -0,0 +1,327 @@
+@@ -0,0 +1,334 @@
 +#include "chat-peg-parser.h"
 +#include "chat-auto-parser.h"
 +#include "parsers/parsers.h"
@@ -158,12 +158,19 @@ index 0000000..ccec1e8
 +        return p.tag("runtime-emit:" + text, p.eps());
 +    }
 +
++    common_peg_parser raw_string(const std::string & stop) {
++        // until() can return SUCCESS while withholding a partial delimiter.
++        // Confirm the full delimiter without consuming it before closing the
++        // JSON string. A possible delimiter prefix must remain a partial value.
++        return p.tag("runtime-string", p.until(stop) + p.peek(p.literal(stop)));
++    }
++
 +    common_peg_parser value(const json & schema, const std::string & encoding, const std::string & stop) {
 +        if (encoding == "json") {
 +            return leaf(p.tag("runtime-json", p.json()), {{"json_schema", schema}});
 +        }
 +        require(encoding == "raw" && !stop.empty(), "raw values require a closing delimiter");
-+        return leaf(p.tag("runtime-string", p.until(stop)),
++        return leaf(raw_string(stop),
 +            {{"json_schema", schema}, {"tool_input_mode", "raw"}, {"tool_input_stop", stop}});
 +    }
 +
@@ -244,7 +251,7 @@ index 0000000..ccec1e8
 +            bound.insert(tool->name);
 +            const auto stop = node.at("stop").get<std::string>();
 +            require(!stop.empty(), "input needs a closing delimiter");
-+            return leaf(p.tag("runtime-string", p.until(stop)),
++            return leaf(raw_string(stop),
 +                {{"lark_grammar", tool->input_grammar}, {"tool_input_mode", "raw"}, {"tool_input_stop", stop}});
 +        }
 +        if (op == "parameters") {
@@ -715,10 +722,10 @@ index 4224a15..ec0b971 100644
 +endif()
 diff --git a/tests/test-tool-input-grammar.cpp b/tests/test-tool-input-grammar.cpp
 new file mode 100644
-index 0000000..8def8b0
+index 0000000..22320b1
 --- /dev/null
 +++ b/tests/test-tool-input-grammar.cpp
-@@ -0,0 +1,270 @@
+@@ -0,0 +1,280 @@
 +#ifdef NDEBUG
 +#undef NDEBUG
 +#endif
@@ -921,6 +928,7 @@ index 0000000..8def8b0
 +    // Prefix A + a possible delimiter prefix must not bypass the body requirement AB.
 +    auto boundary = matcher(raw_grammar("start: \"AB\"", "\n</parameter>\n"));
 +    assert(!llg_matcher_get_error(boundary.get()));
++    assert(llg_matcher_compute_mask(boundary.get()) == 0);
 +    assert(llg_matcher_consume_token(boundary.get(), 'A') == 0);
 +    assert(llg_matcher_compute_mask(boundary.get()) == 0);
 +    auto mask = llg_matcher_get_mask(boundary.get());
@@ -935,6 +943,11 @@ index 0000000..8def8b0
 +        const auto & tools = entry.at("tools");
 +        std::cerr << "Testing runtime format: " << profile << "\n";
 +        auto p = apply(file, tools, false, true, false, profile);
++        if (entry.value("compile_error", false)) {
++            auto failed = matcher(grammar(p));
++            assert(llg_matcher_get_error(failed.get()));
++            continue;
++        }
 +        check(p, "Hello", true);
 +        for (const auto & sample : entry.at("accept")) {
 +            const std::string text = sample.at("text");
@@ -956,8 +969,12 @@ index 0000000..8def8b0
 +                if (partial.tool_calls.empty()) { continue; }
 +                assert(partial.tool_calls[0].name == msg.tool_calls[0].name);
 +                const auto & current = partial.tool_calls[0].arguments;
-+                assert(current.compare(0, previous.size(), previous) == 0);
-+                assert(msg.tool_calls[0].arguments.compare(0, current.size(), current) == 0);
++                if (current.compare(0, previous.size(), previous) != 0 ||
++                    msg.tool_calls[0].arguments.compare(0, current.size(), current) != 0) {
++                    throw std::runtime_error("non-monotonic stream in " + profile + " at byte " + std::to_string(i) +
++                        ": previous=" + json(previous).dump() + " current=" + json(current).dump() +
++                        " final=" + json(msg.tool_calls[0].arguments).dump());
++                }
 +                previous = current;
 +            }
 +            auto single = apply(file, tools, true, false, false, profile);
