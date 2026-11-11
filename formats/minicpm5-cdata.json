@@ -5,7 +5,12 @@
     "</think>"
   ],
   "preserved_tokens": [
-    "<function name=\"",
+    "<function",
+    "</function>",
+    "<param",
+    "</param>",
+    "<![CDATA[",
+    "]]>",
     "<think>",
     "</think>"
   ],

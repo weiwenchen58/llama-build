@@ -6,7 +6,9 @@
   ],
   "preserved_tokens": [
     "<|tool_call>",
-    "<|channel>thought\n",
+    "<tool_call|>",
+    "<|\"|>",
+    "<|channel>",
     "<channel|>"
   ],
   "root": [

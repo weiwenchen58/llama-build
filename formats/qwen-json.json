@@ -6,6 +6,7 @@
   ],
   "preserved_tokens": [
     "<tool_call>",
+    "</tool_call>",
     "<think>",
     "</think>"
   ],

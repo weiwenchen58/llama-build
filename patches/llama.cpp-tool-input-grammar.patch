@@ -59,10 +59,10 @@ index 114fa04..649c45d 100644
  
 diff --git a/common/chat-tool-grammar.cpp b/common/chat-tool-grammar.cpp
 new file mode 100644
-index 0000000..5ac3f80
+index 0000000..511b503
 --- /dev/null
 +++ b/common/chat-tool-grammar.cpp
-@@ -0,0 +1,321 @@
+@@ -0,0 +1,323 @@
 +#include "chat-peg-parser.h"
 +#include "chat-auto-parser.h"
 +#include "parsers/parsers.h"
@@ -359,15 +359,17 @@ index 0000000..5ac3f80
 +common_chat_msg common_chat_runtime_map(const common_peg_ast_arena & arena, const common_peg_parse_result & parsed) {
 +    common_chat_msg result;
 +    result.role = "assistant";
++    common_chat_tool_call pending;
 +    common_chat_tool_call * call = nullptr;
 +    bool has_key = false;
 +    arena.visit(parsed, [&](const common_peg_ast_node & node) {
 +        const auto text = node.sanitized_text();
 +        if (node.tag == "content") { result.content += text; }
 +        else if (node.tag == "reasoning") { result.reasoning_content += text; }
-+        else if (node.tag == "runtime-tool") { call = nullptr; has_key = false; }
++        else if (node.tag == "runtime-tool") { pending = {}; call = &pending; has_key = false; }
 +        else if (node.tag == "runtime-name") {
-+            result.tool_calls.push_back({text, "", ""});
++            pending.name = text;
++            result.tool_calls.push_back(pending);
 +            call = &result.tool_calls.back();
 +        } else if (call) {
 +            if (node.tag == "runtime-json") { call->arguments += text; }

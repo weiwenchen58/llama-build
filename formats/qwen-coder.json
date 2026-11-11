@@ -6,6 +6,11 @@
   ],
   "preserved_tokens": [
     "<tool_call>",
+    "</tool_call>",
+    "<function=",
+    "</function>",
+    "<parameter=",
+    "</parameter>",
     "<think>",
     "</think>"
   ],
