@@ -123,10 +123,10 @@ index 114fa04..2cc3bbc 100644
  
 diff --git a/common/chat-tool-grammar.cpp b/common/chat-tool-grammar.cpp
 new file mode 100644
-index 0000000..8cd74ed
+index 0000000..710eefe
 --- /dev/null
 +++ b/common/chat-tool-grammar.cpp
-@@ -0,0 +1,790 @@
+@@ -0,0 +1,875 @@
 +#include "chat-peg-parser.h"
 +#include "chat-auto-parser.h"
 +#include "parsers/parsers.h"
@@ -205,6 +205,7 @@ index 0000000..8cd74ed
 +        std::vector<std::string> forbidden_prefixes;
 +    };
 +    struct result { id node; bool changed; };
++    struct prefix_arc { size_t from; std::string target; std::string pattern; };
 +
 +    const common_peg_arena & source;
 +    common_peg_arena output;
@@ -517,6 +518,93 @@ index 0000000..8cd74ed
 +        }, source.get(node));
 +    }
 +
++    static std::string regular_prefix(const std::vector<prefix_arc> & arcs, size_t state_count,
++                                      const std::vector<size_t> & accepting) {
++        const size_t missing = static_cast<size_t>(-1);
++        std::vector<std::string> expressions{"\"\""};
++        std::map<std::string, size_t> interned{{"\"\"", 0}};
++        auto expression = [&](std::string text) {
++            if (auto found = interned.find(text); found != interned.end()) { return found->second; }
++            if (expressions.size() >= 100000) { throw std::invalid_argument("input_grammar: prefix regex exceeds compilation budget"); }
++            auto index = expressions.size();
++            interned[text] = index;
++            expressions.push_back(std::move(text));
++            return index;
++        };
++        auto name = [](size_t index) { return "PFX" + std::to_string(index); };
++        auto concatenate = [&](size_t left, size_t right) {
++            if (left == missing || right == missing) { return missing; }
++            if (left == 0) { return right; }
++            if (right == 0) { return left; }
++            return expression(name(left) + " " + name(right));
++        };
++        auto alternate = [&](size_t left, size_t right) {
++            if (left == missing) { return right; }
++            if (right == missing || left == right) { return left; }
++            if (left > right) { std::swap(left, right); }
++            return expression(name(left) + " | " + name(right));
++        };
++        const size_t start = state_count;
++        size_t node_count = state_count + 1;
++        std::map<std::string, size_t> ends;
++        if (!accepting.empty()) { ends[""] = node_count++; }
++        for (const auto & arc : arcs) {
++            if (arc.target.front() == 'r' && !ends.count(arc.target)) { ends[arc.target] = node_count++; }
++        }
++        std::vector<std::map<size_t, size_t>> outgoing(node_count);
++        std::vector<std::set<size_t>> incoming(node_count);
++        auto add_edge = [&](size_t from, size_t to, size_t rx) {
++            auto found = outgoing[from].find(to);
++            outgoing[from][to] = alternate(found == outgoing[from].end() ? missing : found->second, rx);
++            incoming[to].insert(from);
++        };
++        add_edge(start, 0, 0);
++        for (auto state : accepting) { add_edge(state, ends.at(""), 0); }
++        for (const auto & arc : arcs) {
++            const size_t target = arc.target.front() == 'p' ? std::stoul(arc.target.substr(1)) : ends.at(arc.target);
++            add_edge(arc.from, target, expression(arc.pattern));
++        }
++        // Eliminate DFA states into a shared regex DAG, not per-byte Earley rules.
++        std::set<size_t> remaining;
++        for (size_t i = 0; i < state_count; ++i) { remaining.insert(i); }
++        while (!remaining.empty()) {
++            size_t selected = *remaining.begin(), best = missing;
++            for (auto node : remaining) {
++                const size_t self = outgoing[node].count(node);
++                const size_t score = (incoming[node].size() - self) * (outgoing[node].size() - self);
++                if (score < best) { best = score; selected = node; }
++            }
++            const auto in = incoming[selected];
++            const auto out = outgoing[selected];
++            const auto self = out.find(selected);
++            const size_t loop = self == out.end() || self->second == 0 ? 0 : expression(name(self->second) + "*");
++            for (auto from : in) {
++                if (from == selected) { continue; }
++                const auto head = concatenate(outgoing[from].at(selected), loop);
++                for (const auto & [to, tail] : out) {
++                    if (to != selected) { add_edge(from, to, concatenate(head, tail)); }
++                }
++            }
++            for (auto from : in) { if (from != selected) { outgoing[from].erase(selected); } }
++            for (const auto & [to, unused] : out) { (void) unused; if (to != selected) { incoming[to].erase(selected); } }
++            incoming[selected].clear();
++            outgoing[selected].clear();
++            remaining.erase(selected);
++        }
++        std::string lark;
++        for (size_t i = 0; i < expressions.size(); ++i) { lark += name(i) + ": " + expressions[i] + "\n"; }
++        lark += "start: ";
++        bool first = true;
++        for (const auto & [suffix, sink] : ends) {
++            auto edge = outgoing[start].find(sink);
++            if (edge == outgoing[start].end()) { continue; }
++            lark += (first ? "" : " | ") + name(edge->second) + (suffix.empty() ? "" : " " + suffix);
++            first = false;
++        }
++        if (first) { throw std::invalid_argument("input_grammar: native prefix has no accepting path"); }
++        return lark + "\n";
++    }
++
 +    std::string prefix_language(llama_grammar_parser & parsed, const std::map<uint32_t, std::string> & external_ids) const {
 +        using symbols = std::vector<uint32_t>;
 +        using state_key = std::pair<size_t, symbols>;
@@ -626,7 +714,8 @@ index 0000000..8cd74ed
 +        while (alphabet.count(other)) { --other; }
 +        std::vector<uint32_t> characters(alphabet.begin(), alphabet.end());
 +        characters.push_back(other);
-+        std::string rules;
++        std::vector<prefix_arc> arcs;
++        std::vector<size_t> accepting;
 +        for (size_t index = 0; index < states.size(); ++index) {
 +            if (states.size() > 4096) { throw std::invalid_argument("input_grammar: native prefix DFA exceeds budget"); }
 +            const auto current = states[index];
@@ -649,8 +738,7 @@ index 0000000..8cd74ed
 +                }
 +                targets[target].push_back(cp);
 +            }
-+            std::vector<std::string> alternatives;
-+            if (allow_plain && can_end(current)) { alternatives.push_back("\"\""); }
++            if (allow_plain && can_end(current)) { accepting.push_back(index); }
 +            for (const auto & target : targets) {
 +                const bool has_other = std::find(target.second.begin(), target.second.end(), other) != target.second.end();
 +                std::string pattern = has_other ? "/[^" : "/[";
@@ -661,14 +749,11 @@ index 0000000..8cd74ed
 +                } else { for (auto cp : target.second) { pattern += codepoint(cp); } }
 +                if (pattern == "/[^") { pattern = "/(?s:.)/"; }
 +                else { pattern += "]/"; }
-+                alternatives.push_back(pattern + " " + target.first);
++                arcs.push_back({index, target.first, std::move(pattern)});
 +            }
-+            if (alternatives.empty()) { throw std::invalid_argument("input_grammar: native prefix has a dead state"); }
-+            rules += "p" + std::to_string(index) + ": ";
-+            for (size_t i = 0; i < alternatives.size(); ++i) { rules += (i ? " | " : "") + alternatives[i]; }
-+            rules += "\n";
++            if (targets.empty() && !(allow_plain && can_end(current))) { throw std::invalid_argument("input_grammar: native prefix has a dead state"); }
 +        }
-+        return rules + "start: p0\n";
++        return regular_prefix(arcs, states.size(), accepting);
 +    }
 +
 +    result compile(id node, context ctx = {}, size_t depth = 0) {
