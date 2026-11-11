@@ -59,10 +59,10 @@ index 114fa04..649c45d 100644
  
 diff --git a/common/chat-tool-grammar.cpp b/common/chat-tool-grammar.cpp
 new file mode 100644
-index 0000000..511b503
+index 0000000..ccec1e8
 --- /dev/null
 +++ b/common/chat-tool-grammar.cpp
-@@ -0,0 +1,323 @@
+@@ -0,0 +1,327 @@
 +#include "chat-peg-parser.h"
 +#include "chat-auto-parser.h"
 +#include "parsers/parsers.h"
@@ -139,6 +139,10 @@ index 0000000..511b503
 +    json property;
 +    std::string property_name;
 +    size_t nodes = 0;
++
++    format_compiler(common_chat_peg_builder & builder, const common_chat_templates_inputs & request,
++                    const json & descriptor, const std::string & prefix)
++        : p(builder), inputs(request), spec(descriptor), prefill(prefix) {}
 +
 +    void require(bool ok, const std::string & message) {
 +        if (!ok) { throw std::invalid_argument("native_tool_format: " + message); }
@@ -711,10 +715,10 @@ index 4224a15..ec0b971 100644
 +endif()
 diff --git a/tests/test-tool-input-grammar.cpp b/tests/test-tool-input-grammar.cpp
 new file mode 100644
-index 0000000..be48fdb
+index 0000000..8def8b0
 --- /dev/null
 +++ b/tests/test-tool-input-grammar.cpp
-@@ -0,0 +1,255 @@
+@@ -0,0 +1,270 @@
 +#ifdef NDEBUG
 +#undef NDEBUG
 +#endif
@@ -732,6 +736,11 @@ index 0000000..be48fdb
 +using json = common_json;
 +using matcher_ptr = std::unique_ptr<LlgMatcher, decltype(&llg_free_matcher)>;
 +static LlgTokenizer * tokenizer;
++static json read_json(std::istream & stream) {
++    std::stringstream text;
++    text << stream.rdbuf();
++    return json::parse(text.str());
++}
 +static const std::vector<std::string> pieces = {"<tool_call>", "</tool_call>", "\\n", "\\\"", "<function", "</param>", "</function>"};
 +
 +static matcher_ptr matcher(const std::string & grammar) {
@@ -790,7 +799,7 @@ index 0000000..be48fdb
 +    return {{"type", "function"}, {"function", function}};
 +}
 +
-+static common_chat_params apply(const std::string & file, const json & tools, bool required, bool parallel, bool none = false, const std::string & profile = "qwen-json") {
++static common_chat_params apply(const std::string & file, const json & tools, bool required, bool parallel, bool none = false, const std::string & profile = "qwen-json", bool thinking = false) {
 +    std::ifstream stream("models/templates/" + file);
 +    assert(stream.good());
 +    std::stringstream text;
@@ -802,13 +811,13 @@ index 0000000..be48fdb
 +    msg.content = "Use the appropriate tool.";
 +    inputs.messages = {msg};
 +    inputs.tools = common_chat_tools_parse_oaicompat(tools);
-+    inputs.enable_thinking = false;
++    inputs.enable_thinking = thinking;
 +    inputs.tool_choice = none ? COMMON_CHAT_TOOL_CHOICE_NONE :
 +        (required ? COMMON_CHAT_TOOL_CHOICE_REQUIRED : COMMON_CHAT_TOOL_CHOICE_AUTO);
 +    inputs.parallel_tool_calls = parallel;
 +    std::ifstream descriptor("tests/runtime-tool-formats/" + profile + ".json");
 +    assert(descriptor.good());
-+    descriptor >> inputs.native_tool_format;
++    inputs.native_tool_format = read_json(descriptor);
 +    return common_chat_templates_apply(tmpl.get(), inputs);
 +}
 +
@@ -920,7 +929,7 @@ index 0000000..be48fdb
 +
 +    std::ifstream cases_stream("tests/runtime-tool-formats/tests.json");
 +    assert(cases_stream.good());
-+    json cases; cases_stream >> cases;
++    const auto cases = read_json(cases_stream);
 +    for (const auto & entry : cases) {
 +        const std::string profile = entry.at("profile"), file = entry.at("template");
 +        const auto & tools = entry.at("tools");
@@ -933,7 +942,7 @@ index 0000000..be48fdb
 +            check(p, text + text, true);
 +            auto msg = parse(p, text);
 +            assert(msg.tool_calls.size() == 1);
-+            assert(msg.tool_calls[0].name == sample.at("name"));
++            assert(msg.tool_calls[0].name == sample.at("name").get<std::string>());
 +            if (json::parse(msg.tool_calls[0].arguments) != sample.at("arguments")) {
 +                throw std::runtime_error("mapping mismatch " + msg.tool_calls[0].arguments);
 +            }
@@ -959,6 +968,16 @@ index 0000000..be48fdb
 +            expect_error([&] { parse(single, text.substr(0, text.size() - 1)); });
 +        }
 +        for (const auto & rejected : entry.at("reject")) { check(p, rejected.get<std::string>(), false); }
++        auto thinking = apply(file, tools, false, true, false, profile, true);
++        std::ifstream descriptor("tests/runtime-tool-formats/" + profile + ".json");
++        const auto spec = read_json(descriptor);
++        const std::string start = spec.at("thinking_start"), end = spec.at("thinking_end").at(0);
++        const std::string thought = (thinking.generation_prompt.find(start) == std::string::npos ? start : "") +
++            "Analysis" + end + "Hello";
++        check(thinking, thought, true);
++        const auto thought_msg = parse(thinking, thought);
++        assert(thought_msg.reasoning_content == "Analysis");
++        assert(thought_msg.content == "Hello");
 +        auto disabled = apply(file, tools, false, true, true, profile);
 +        check(disabled, "Hello", true);
 +        assert(parse(disabled, "Hello").tool_calls.empty());
