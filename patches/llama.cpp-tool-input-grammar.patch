@@ -1,0 +1,1008 @@
+diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
+index 8e3c88d..e173276 100644
+--- a/common/CMakeLists.txt
++++ b/common/CMakeLists.txt
+@@ -65,6 +65,7 @@ add_library(${TARGET}
+     chat-auto-parser.h
+     chat-diff-analyzer.cpp
+     chat-peg-parser.cpp
++    chat-tool-grammar.cpp
+     chat-peg-parser.h
+     chat.cpp
+     chat.h
+@@ -156,6 +157,12 @@ target_link_libraries(${TARGET} PRIVATE cpp-httplib)
+ if (LLAMA_LLGUIDANCE)
+     include(ExternalProject)
+     set(LLGUIDANCE_SRC ${CMAKE_BINARY_DIR}/llguidance/source)
++    set(LLGUIDANCE_PATCH "" CACHE FILEPATH "Patch applied to the pinned LLGuidance source")
++    set(LLGUIDANCE_PATCH_COMMAND "")
++    if (LLGUIDANCE_PATCH)
++        find_package(Git REQUIRED)
++        set(LLGUIDANCE_PATCH_COMMAND ${GIT_EXECUTABLE} apply --whitespace=error ${LLGUIDANCE_PATCH})
++    endif()
+     set(LLGUIDANCE_PATH ${LLGUIDANCE_SRC}/target/release)
+     set(LLGUIDANCE_LIB_NAME "${CMAKE_STATIC_LIBRARY_PREFIX}llguidance${CMAKE_STATIC_LIBRARY_SUFFIX}")
+ 
+@@ -167,14 +174,15 @@ if (LLAMA_LLGUIDANCE)
+         SOURCE_DIR ${LLGUIDANCE_SRC}
+         BUILD_IN_SOURCE TRUE
+         CONFIGURE_COMMAND ""
+-        BUILD_COMMAND cargo build --release --package llguidance
++        PATCH_COMMAND ${LLGUIDANCE_PATCH_COMMAND}
++        BUILD_COMMAND cargo build --locked --release --package llguidance
+         INSTALL_COMMAND ""
+         BUILD_BYPRODUCTS ${LLGUIDANCE_PATH}/${LLGUIDANCE_LIB_NAME} ${LLGUIDANCE_PATH}/llguidance.h
+         UPDATE_COMMAND ""
+     )
+     target_compile_definitions(${TARGET} PUBLIC LLAMA_USE_LLGUIDANCE)
+ 
+-    add_library(llguidance STATIC IMPORTED)
++    add_library(llguidance STATIC IMPORTED GLOBAL)
+     set_target_properties(llguidance PROPERTIES IMPORTED_LOCATION ${LLGUIDANCE_PATH}/${LLGUIDANCE_LIB_NAME})
+     add_dependencies(llguidance llguidance_ext)
+ 
+diff --git a/common/chat-peg-parser.h b/common/chat-peg-parser.h
+index 114fa04..649c45d 100644
+--- a/common/chat-peg-parser.h
++++ b/common/chat-peg-parser.h
+@@ -52,6 +52,11 @@ class common_chat_peg_minimax_m3_mapper : public common_chat_peg_mapper {
+     void visit(const common_peg_ast_arena & arena, common_peg_ast_id id);
+ };
+ 
++common_chat_params common_chat_apply_runtime_format(const common_chat_template & tmpl,
++    const autoparser::generation_params & params, const common_chat_templates_inputs & inputs);
++common_chat_msg common_chat_runtime_map(const common_peg_ast_arena & arena,
++    const common_peg_parse_result & result);
++
+ struct content_structure;
+ struct tool_call_structure;
+ 
+diff --git a/common/chat-tool-grammar.cpp b/common/chat-tool-grammar.cpp
+new file mode 100644
+index 0000000..107cf66
+--- /dev/null
++++ b/common/chat-tool-grammar.cpp
+@@ -0,0 +1,316 @@
++#include "chat-peg-parser.h"
++#include "chat-auto-parser.h"
++#include "parsers/parsers.h"
++#include "json-schema-to-grammar.h"
++#include "../src/llama-grammar.h"
++#include <cstdio>
++#include <set>
++
++using json = common_json;
++
++static std::string codepoint(uint32_t value) {
++    char buffer[20];
++    snprintf(buffer, sizeof(buffer), "\\x{%x}", value);
++    return buffer;
++}
++
++// Reuse llama.cpp's GBNF parser, including its lowering of repetitions to rules.
++// Translate parsed elements, never splice or regex-edit the generated grammar text.
++static std::string emit_lark(const llama_grammar_parser & parsed, const std::string & prefix,
++                             const std::map<uint32_t, std::string> & bodies = {}) {
++    std::string result;
++    for (size_t i = 0; i < parsed.rules.size(); ++i) {
++        result += prefix + std::to_string(i) + ": ";
++        auto body = bodies.find(i);
++        if (body != bodies.end()) {
++            result += body->second + "\n";
++            continue;
++        }
++        const auto & rule = parsed.rules[i];
++        for (size_t j = 0; j < rule.size(); ++j) {
++            const auto & elem = rule[j];
++            switch (elem.type) {
++                case LLAMA_GRETYPE_END: break;
++                case LLAMA_GRETYPE_ALT: result += " | "; break;
++                case LLAMA_GRETYPE_RULE_REF: result += prefix + std::to_string(elem.value) + " "; break;
++                case LLAMA_GRETYPE_CHAR_ANY: result += "/(?s:.)/ "; break;
++                case LLAMA_GRETYPE_CHAR:
++                case LLAMA_GRETYPE_CHAR_NOT: {
++                    result += elem.type == LLAMA_GRETYPE_CHAR_NOT ? "/[^" : "/[";
++                    result += codepoint(elem.value);
++                    while (j + 1 < rule.size()) {
++                        const auto & next = rule[j + 1];
++                        if (next.type == LLAMA_GRETYPE_CHAR_RNG_UPPER) {
++                            result += "-" + codepoint(next.value);
++                        } else if (next.type == LLAMA_GRETYPE_CHAR_ALT) {
++                            result += codepoint(next.value);
++                        } else {
++                            break;
++                        }
++                        ++j;
++                    }
++                    result += "]/ ";
++                    break;
++                }
++                default: throw std::invalid_argument("input_grammar: unsupported native grammar terminal");
++            }
++        }
++        result += "\n";
++    }
++    return result;
++}
++
++namespace {
++// The descriptor is data, never executable source. The same tree supplies the
++// response parser and the outer constraint; only body/schema leaves use LLG.
++struct format_compiler {
++    common_chat_peg_builder & p;
++    const common_chat_templates_inputs & inputs;
++    const json & spec;
++    const std::string & prefill;
++    std::map<std::string, json> external;
++    std::set<std::string> bound;
++    const common_chat_tool * tool = nullptr;
++    json property;
++    std::string property_name;
++    size_t nodes = 0;
++
++    void require(bool ok, const std::string & message) {
++        if (!ok) { throw std::invalid_argument("native_tool_format: " + message); }
++    }
++
++    common_peg_parser leaf(const common_peg_parser & parser, json grammar) {
++        const std::string name = "external-" + std::to_string(external.size());
++        external.emplace(name, std::move(grammar));
++        return p.rule(name, p.gbnf(parser, "\"\""));
++    }
++
++    common_peg_parser emit(const std::string & text) {
++        return p.tag("runtime-emit:" + text, p.eps());
++    }
++
++    common_peg_parser value(const json & schema, const std::string & encoding, const std::string & stop) {
++        if (encoding == "json") {
++            return leaf(p.tag("runtime-json", p.json()), {{"json_schema", schema}});
++        }
++        require(encoding == "raw" && !stop.empty(), "raw values require a closing delimiter");
++        return leaf(p.tag("runtime-string", p.until(stop)),
++            {{"json_schema", schema}, {"tool_input_mode", "raw"}, {"tool_input_stop", stop}});
++    }
++
++    bool condition(const std::string & name) {
++        if (name == "required") { return inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED; }
++        if (name == "parallel") { return inputs.parallel_tool_calls; }
++        if (name == "thinking") { return inputs.enable_thinking; }
++        if (name == "thinking_prefilled") {
++            const auto start = spec.value("thinking_start", "");
++            return inputs.enable_thinking && !start.empty() && prefill.find(start) != std::string::npos;
++        }
++        if (name == "tools") { return !inputs.tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE; }
++        if (name == "input_grammar") { require(tool, "input_grammar condition outside tools"); return !tool->input_grammar.empty(); }
++        if (name == "string") { require(!property.is_null(), "string condition outside parameters"); return property.value("type", "") == "string"; }
++        throw std::invalid_argument("native_tool_format: unknown condition " + name);
++    }
++
++    common_peg_parser compile(const json & node, size_t depth = 0) {
++        require(depth < 64 && ++nodes <= 10000, "descriptor expansion exceeds budget");
++        if (node.is_string()) { return p.literal(node.get<std::string>()); }
++        if (node.is_array()) {
++            std::vector<common_peg_parser> parts;
++            for (const auto & child : node) { parts.push_back(compile(child, depth + 1)); }
++            return p.sequence(parts);
++        }
++        require(node.is_object(), "a node must be a literal, sequence or operation");
++        const auto op = node.at("op").get<std::string>();
++        auto child = [&]() { return compile(node.at("item"), depth + 1); };
++        if (op == "ref") { return compile(spec.at("definitions").at(node.at("name").get<std::string>()), depth + 1); }
++        if (op == "if") { return compile(node.at(condition(node.at("condition")) ? "then" : "else"), depth + 1); }
++        if (op == "choice") {
++            std::vector<common_peg_parser> alternatives;
++            for (const auto & item : node.at("items")) { alternatives.push_back(compile(item, depth + 1)); }
++            require(!alternatives.empty(), "empty choice");
++            return p.choice(alternatives);
++        }
++        if (op == "repeat") {
++            const int min = node.value("min", 0), max = node.value("max", -1);
++            require(min >= 0 && min <= 100 && (max == -1 || (max >= min && max <= 100)), "invalid repetition");
++            return p.repeat(child(), min, max);
++        }
++        if (op == "space") { return p.space(); }
++        if (op == "until") {
++            const auto stops = node.at("stops").get<std::vector<std::string>>();
++            for (const auto & stop : stops) { require(!stop.empty(), "empty delimiter"); }
++            return p.until_one_of(stops);
++        }
++        if (op == "content" || op == "reasoning") { return p.tag(op, child()); }
++        if (op == "emit") { return emit(node.at("value")); }
++        if (op == "tools") {
++            require(!tool, "nested tools expansion");
++            require(!inputs.tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE, "tools disabled");
++            std::vector<common_peg_parser> alternatives;
++            for (const auto & entry : inputs.tools) {
++                tool = &entry;
++                alternatives.push_back(p.tag("runtime-tool", p.eps()) + child());
++            }
++            tool = nullptr;
++            return p.choice(alternatives);
++        }
++        if (op == "name") {
++            require(tool, "name outside tools");
++            // Names are literal bytes. Quote/bracket characters belong in data.
++            return p.atomic(p.tag("runtime-name", p.literal(tool->name)));
++        }
++        if (op == "args") {
++            require(tool, "args outside tools");
++            bound.insert(tool->name);
++            if (tool->input_grammar.empty()) { return value(json::parse(tool->parameters), "json", ""); }
++            auto body = leaf(p.string_content('"'), {{"lark_grammar", tool->input_grammar}, {"tool_input_mode", "json_string"}});
++            return p.tag("runtime-json", p.literal("{\"input\":\"") + body + p.literal("\"}"));
++        }
++        if (op == "input") {
++            require(tool && !tool->input_grammar.empty(), "input needs an input_grammar tool");
++            bound.insert(tool->name);
++            const auto stop = node.at("stop").get<std::string>();
++            require(!stop.empty(), "input needs a closing delimiter");
++            return leaf(p.tag("runtime-string", p.until(stop)),
++                {{"lark_grammar", tool->input_grammar}, {"tool_input_mode", "raw"}, {"tool_input_stop", stop}});
++        }
++        if (op == "parameters") {
++            require(tool && tool->input_grammar.empty() && property.is_null(), "parameters needs ordinary tool arguments");
++            auto schema = json::parse(tool->parameters);
++            require(schema.is_object() && schema.value("type", "") == "object" &&
++                    schema.contains("properties") && schema.at("properties").is_object() &&
++                    schema.contains("additionalProperties") && schema.at("additionalProperties") == false,
++                    "parameters requires a closed object schema; use args for general JSON Schema");
++            static const std::set<std::string> allowed = {"type", "properties", "required", "additionalProperties", "title", "description"};
++            for (const auto & item : schema.items()) { require(allowed.count(item.key()), "unsupported object constraint in parameters: " + item.key()); }
++            std::set<std::string> required;
++            for (const auto & name : schema.value("required", json::array())) { required.insert(name.get<std::string>()); }
++            for (const auto & name : required) { require(schema.at("properties").contains(name), "required property missing from properties"); }
++            bound.insert(tool->name);
++            std::vector<common_peg_parser> parts;
++            std::vector<bool> mandatory;
++            for (const auto & item : schema.at("properties").items()) {
++                property_name = item.key(); property = item.value();
++                auto part = child();
++                parts.push_back(part);
++                mandatory.push_back(required.count(property_name) != 0);
++            }
++            property = nullptr; property_name.clear();
++            auto after = p.eps(), first = p.eps();
++            const auto separator = node.value("separator", "");
++            for (size_t i = parts.size(); i-- > 0;) {
++                auto with_separator = p.literal(separator) + parts[i] + after;
++                auto without_separator = parts[i] + after;
++                after = p.rule("parameters-after-" + std::to_string(nodes) + "-" + std::to_string(i),
++                    mandatory[i] ? with_separator : (with_separator | after));
++                first = p.rule("parameters-first-" + std::to_string(nodes) + "-" + std::to_string(i),
++                    mandatory[i] ? without_separator : (without_separator | first));
++            }
++            return emit("{") + first + emit("}");
++        }
++        if (op == "parameter_name") {
++            require(!property.is_null(), "parameter_name outside parameters");
++            return p.atomic(p.tag("runtime-key", p.literal(property_name)));
++        }
++        if (op == "parameter_value") {
++            require(!property.is_null(), "parameter_value outside parameters");
++            if (node.value("scalar_only", false)) {
++                const auto type = property.value("type", "");
++                require(type == "string" || type == "integer" || type == "number" || type == "boolean" || type == "null",
++                        "this descriptor value codec only supports scalar properties");
++            }
++            return value(property, node.value("encoding", "json"), node.value("stop", ""));
++        }
++        throw std::invalid_argument("native_tool_format: unknown operation " + op);
++    }
++};
++} // namespace
++
++common_chat_params common_chat_apply_runtime_format(const common_chat_template & tmpl,
++        const autoparser::generation_params & params, const common_chat_templates_inputs & inputs) {
++#ifndef LLAMA_USE_LLGUIDANCE
++    throw std::invalid_argument("native_tool_format requires LLAMA_LLGUIDANCE=ON");
++#endif
++    const auto & spec = inputs.native_tool_format;
++    if (!spec.is_object() || spec.value("version", 0) != 1 || spec.dump().size() > 1024 * 1024) {
++        throw std::invalid_argument("native_tool_format: expected version 1 descriptor, at most 1 MiB");
++    }
++    if (!inputs.grammar.empty() || !inputs.json_schema.empty() || inputs.force_pure_content ||
++        inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE) {
++        throw std::invalid_argument("native_tool_format cannot combine with grammar, response schema, pure content or continuation");
++    }
++    std::set<std::string> names;
++    for (const auto & tool : inputs.tools) {
++        if (!names.insert(tool.name).second) { throw std::invalid_argument("native_tool_format: duplicate tool name"); }
++        if (tool.name.empty() || tool.name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-") != std::string::npos) {
++            throw std::invalid_argument("native_tool_format: tool name must use ASCII letters, digits, underscore, dot or dash");
++        }
++    }
++    common_chat_params data;
++    data.prompt = common_chat_template_direct_apply_impl(tmpl, params);
++    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, params);
++    data.format = COMMON_CHAT_FORMAT_PEG_RUNTIME;
++    data.preserved_tokens = spec.value("preserved_tokens", std::vector<std::string>{});
++    data.additional_stops = spec.value("additional_stops", std::vector<std::string>{});
++    data.supports_thinking = inputs.enable_thinking;
++    data.thinking_start_tag = spec.value("thinking_start", "");
++    data.thinking_end_tags = spec.value("thinking_end", std::vector<std::string>{});
++    std::map<std::string, json> external;
++    data.parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
++        format_compiler compiler{p, inputs, spec, data.generation_prompt};
++        auto root = compiler.compile(spec.at("root"));
++        if (inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE && compiler.bound != names) {
++            throw std::invalid_argument("native_tool_format: every tool must bind its arguments to grammar/schema");
++        }
++        external = std::move(compiler.external);
++        return p.literal(data.generation_prompt) + root + p.end();
++    });
++    const auto gbnf = build_grammar([&](const common_grammar_builder & builder) { data.parser.build_grammar(builder); });
++    llama_grammar_parser parsed;
++    if (!parsed.parse(gbnf.c_str())) { throw std::invalid_argument("native_tool_format: invalid generated grammar"); }
++    json grammars = json::array({json::object()});
++    std::map<uint32_t, std::string> replacements;
++    for (auto & entry : external) {
++        const auto id = parsed.symbol_ids.at(entry.first);
++        const auto name = "body" + std::to_string(grammars.size());
++        replacements[id] = "@" + name;
++        entry.second["name"] = name;
++        grammars.push_back(std::move(entry.second));
++    }
++    grammars[0] = {{"name", "native"}, {"lark_grammar", emit_lark(parsed, "r", replacements) +
++        "start: r" + std::to_string(parsed.symbol_ids.at("root")) + "\n"}};
++    auto markers = data.preserved_tokens;
++    markers.push_back(data.generation_prompt);
++    data.grammar = "%llguidance-json\n" + json{{"grammars", grammars}, {"native_tokens", markers}}.dump();
++    return data;
++}
++
++common_chat_msg common_chat_runtime_map(const common_peg_ast_arena & arena, const common_peg_parse_result & parsed) {
++    common_chat_msg result;
++    result.role = "assistant";
++    common_chat_tool_call * call = nullptr;
++    bool has_key = false;
++    arena.visit(parsed, [&](const common_peg_ast_node & node) {
++        const auto text = node.sanitized_text();
++        if (node.tag == "content") { result.content += text; }
++        else if (node.tag == "reasoning") { result.reasoning_content += text; }
++        else if (node.tag == "runtime-tool") { call = nullptr; has_key = false; }
++        else if (node.tag == "runtime-name") {
++            result.tool_calls.push_back({text, "", ""});
++            call = &result.tool_calls.back();
++        } else if (call) {
++            if (node.tag == "runtime-json") { call->arguments += text; }
++            else if (node.tag == "runtime-string") {
++                auto quoted = json(text).dump();
++                if (node.is_partial) { quoted.pop_back(); }
++                call->arguments += quoted;
++            } else if (node.tag == "runtime-key") {
++                if (has_key) { call->arguments += ","; }
++                call->arguments += json(text).dump() + ":";
++                has_key = true;
++            } else if (node.tag.compare(0, 13, "runtime-emit:") == 0) { call->arguments += node.tag.substr(13); }
++        }
++    });
++    return result;
++}
+diff --git a/common/chat.cpp b/common/chat.cpp
+index 5f956e6..c9c45a0 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -627,6 +627,9 @@ json common_chat_tools_to_json_oaicompat(const std::vector<common_chat_tool> & t
+             { "description", tool.description },
+             { "parameters",  json::parse(tool.parameters) },
+         };
++        if (!tool.input_grammar.empty()) {
++            function["input_grammar"] = {{"syntax", "lark"}, {"definition", tool.input_grammar}};
++        }
+         if (tool.defer_loading) {
+             function["defer_loading"] = true;
+         }
+@@ -677,11 +680,30 @@ std::vector<common_chat_tool> common_chat_tools_parse_oaicompat(const json & too
+                     throw std::invalid_argument("Expected 'defer_loading' to be a boolean, got " + defer.dump());
+                 }
+ 
++                std::string input_grammar;
++                if (function.contains("input_grammar")) {
++                    const auto & grammar = function.at("input_grammar");
++                    const auto & parameters = function.at("parameters");
++                    const bool input_schema = parameters.is_object() && parameters.size() == 4 &&
++                        parameters.value("type", "") == "object" &&
++                        parameters.contains("properties") &&
++                        parameters.at("properties") == json{{"input", {{"type", "string"}}}} &&
++                        parameters.contains("required") && parameters.at("required") == json::array({"input"}) &&
++                        !parameters.value("additionalProperties", true);
++                    // v1 deliberately has one exact body slot, no arbitrary JSON paths.
++                    if (!grammar.is_object() || grammar.size() != 2 || grammar.value("syntax", "") != "lark" ||
++                        !grammar.contains("definition") || !grammar.at("definition").is_string() ||
++                        grammar.at("definition").get<std::string>().empty() || !input_schema) {
++                        throw std::invalid_argument("input_grammar requires Lark and exactly one required string input");
++                    }
++                    input_grammar = grammar.at("definition").get<std::string>();
++                }
+                 result.push_back({
+                     /* .name = */ function.at("name"),
+                     /* .description = */ function.value("description", ""),
+                     /* .parameters = */ function.value("parameters", json::object()).dump(),
+                     /* .defer_loading = */ defer.get<bool>(),
++                    /* .input_grammar = */ input_grammar,
+                 });
+             }
+         }
+@@ -997,6 +1019,7 @@ const char * common_chat_format_name(common_chat_format format) {
+             return "Content-only";
+         case COMMON_CHAT_FORMAT_PEG_SIMPLE:
+             return "peg-simple";
++        case COMMON_CHAT_FORMAT_PEG_RUNTIME: return "runtime";
+         case COMMON_CHAT_FORMAT_PEG_NATIVE:
+             return "peg-native";
+         case COMMON_CHAT_FORMAT_PEG_GEMMA4:
+@@ -1555,6 +1578,10 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
+         }
+     }
+ 
++    if (!inputs.native_tool_format.is_null()) {
++        return common_chat_apply_runtime_format(tmpl, params, inputs);
++    }
++
+     if (inputs.force_pure_content) {
+         LOG_WRN("Forcing pure content template, will not render reasoning or tools separately.");
+         // Create the result structure
+@@ -1678,8 +1705,19 @@ static common_chat_params common_chat_templates_apply_legacy(const struct common
+ common_chat_params common_chat_templates_apply(const struct common_chat_templates *        tmpls,
+                                                const struct common_chat_templates_inputs & inputs) {
+     GGML_ASSERT(tmpls != nullptr);
+-    return inputs.use_jinja ? common_chat_templates_apply_jinja(tmpls, inputs) :
+-                              common_chat_templates_apply_legacy(tmpls, inputs);
++    auto data = inputs.use_jinja ? common_chat_templates_apply_jinja(tmpls, inputs) :
++                                  common_chat_templates_apply_legacy(tmpls, inputs);
++    if (inputs.native_tool_format.is_null() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
++        for (const auto & tool : inputs.tools) {
++            if (!tool.input_grammar.empty()) {
++                throw std::invalid_argument("input_grammar requires native_tool_format version 1");
++            }
++        }
++    }
++    if (!inputs.use_jinja && !inputs.native_tool_format.is_null()) {
++        throw std::invalid_argument("native_tool_format requires Jinja");
++    }
++    return data;
+ }
+ 
+ std::string common_chat_prompt::str() const {
+@@ -1802,7 +1840,8 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
+ 
+     //LOG_DBG("Parsing PEG input with format %s: %s\n", common_chat_format_name(params.format), effective_input.text.c_str());
+ 
+-    common_peg_parse_flags flags = COMMON_PEG_PARSE_FLAG_LENIENT;
++    common_peg_parse_flags flags = params.format == COMMON_CHAT_FORMAT_PEG_RUNTIME ?
++        COMMON_PEG_PARSE_FLAG_NONE : COMMON_PEG_PARSE_FLAG_LENIENT;
+     if (!is_partial) {
+         flags |= COMMON_PEG_PARSE_FLAG_COMPLETE;
+     }
+@@ -1813,6 +1852,14 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
+     common_peg_parse_context ctx(std::move(effective_input.text), std::move(effective_input.tokens), flags);
+     auto result = parser.parse(ctx);
+ 
++    if (params.format == COMMON_CHAT_FORMAT_PEG_RUNTIME) {
++        if ((!is_partial && (!result.success() || result.end != ctx.input.size())) ||
++            (is_partial && result.fail())) {
++            throw std::runtime_error("output does not match native_tool_format");
++        }
++        return common_chat_runtime_map(ctx.ast, result);
++    }
++
+     if (result.fail()) {
+         // During partial parsing, return partial results if any AST nodes were captured
+         // This allows streaming to work correctly for formats like FUNC_MARKDOWN_CODE_BLOCK
+diff --git a/common/chat.h b/common/chat.h
+index ebfc80f..98545b6 100644
+--- a/common/chat.h
++++ b/common/chat.h
+@@ -230,6 +230,7 @@ struct common_chat_tool {
+ 
+     // withheld from the system prompt, a tool_reference reveals it later in the conversation
+     bool defer_loading = false;
++    std::string input_grammar = {}; // LLGuidance Lark for the decoded input string
+ };
+ 
+ enum common_chat_tool_choice {
+@@ -244,6 +245,7 @@ enum common_chat_format {
+     // These are intended to be parsed by the PEG parser
+     COMMON_CHAT_FORMAT_PEG_SIMPLE,
+     COMMON_CHAT_FORMAT_PEG_NATIVE,
++    COMMON_CHAT_FORMAT_PEG_RUNTIME,
+     COMMON_CHAT_FORMAT_PEG_GEMMA4,
+     COMMON_CHAT_FORMAT_PEG_MINIMAX_M3,
+ 
+@@ -277,6 +279,7 @@ struct common_chat_templates_inputs {
+     bool                                  add_bos = false;
+     bool                                  add_eos = false;
+     bool                                  force_pure_content = false;
++    common_json                           native_tool_format;
+ };
+ 
+ struct common_chat_prompt_part {
+diff --git a/common/llguidance.cpp b/common/llguidance.cpp
+index 500bb09..f927e8c 100644
+--- a/common/llguidance.cpp
++++ b/common/llguidance.cpp
+@@ -1,5 +1,9 @@
+ #include "sampling.h"
+ #include "log.h"
++#include "json.h"
++
++#include <cstring>
++#include <set>
+ 
+ #ifdef LLAMA_USE_LLGUIDANCE
+ 
+@@ -39,7 +43,9 @@ static const char * llama_sampler_llg_name(const llama_sampler * /*smpl*/) {
+ static void llama_sampler_llg_accept_impl(llama_sampler * smpl, llama_token token) {
+     auto * ctx = (llama_sampler_llg *) smpl->ctx;
+     if (ctx->grammar) {
+-        llg_matcher_consume_token(ctx->grammar, token);
++        if (llg_matcher_consume_token(ctx->grammar, token) < 0) {
++            throw std::runtime_error(std::string("llguidance consume: ") + llg_matcher_get_error(ctx->grammar));
++        }
+     }
+ }
+ 
+@@ -51,13 +57,13 @@ static void llama_sampler_llg_apply(llama_sampler * smpl, llama_token_data_array
+             if (llg_matcher_compute_mask(ctx->grammar) == 0) {
+                 mask = llg_matcher_get_mask(ctx->grammar);
+             } else {
+-                LOG_ERR("llg error: %s\n", llg_matcher_get_error(ctx->grammar));
+-                llg_free_matcher(ctx->grammar);
+-                ctx->grammar = nullptr;
+-                return;
++                throw std::runtime_error(std::string("llguidance mask: ") + llg_matcher_get_error(ctx->grammar));
+             }
+         }
+ 
++        if (!mask) {
++            throw std::runtime_error("llguidance returned no token mask");
++        }
+         for (size_t i = 0; i < cur_p->size; ++i) {
+             auto token = cur_p->data[i].id;
+             if ((mask[token / 32] & (1 << (token % 32))) == 0) {
+@@ -136,12 +142,14 @@ static size_t llama_sampler_llg_tokenize_fn(const void * user_data, const uint8_
+     return r;
+ }
+ 
+-static LlgTokenizer * llama_sampler_llg_new_tokenizer(const llama_vocab * vocab) {
++static LlgTokenizer * llama_sampler_llg_new_tokenizer(const llama_vocab * vocab,
++                                                      const std::set<std::string> & native_tokens) {
+     // TODO store the tokenizer in the vocab somehow
+     static const llama_vocab * vocab_cache;
+     static LlgTokenizer *      tokenizer_cache;
++    static std::set<std::string> native_tokens_cache;
+ 
+-    if (vocab_cache == vocab) {
++    if (vocab_cache == vocab && native_tokens_cache == native_tokens) {
+         return llg_clone_tokenizer(tokenizer_cache);
+     }
+ 
+@@ -176,8 +184,13 @@ static LlgTokenizer * llama_sampler_llg_new_tokenizer(const llama_vocab * vocab)
+                 GGML_ABORT("llama_detokenize failed\n");
+             }
+             if (size != 0) {
+-                *dp = '\xff';  // special token prefix marker
+-                size += 1;
++                if (!llama_vocab_is_eog(vocab, token) && native_tokens.count(std::string(dp + 1, size))) {
++                    // Native tool syntax is matched as the same visible text used by the response parser.
++                    memmove(dp, dp + 1, size);
++                } else {
++                    *dp = '\xff';  // special token prefix marker
++                    size += 1;
++                }
+             }
+         }
+ 
+@@ -214,16 +227,34 @@ static LlgTokenizer * llama_sampler_llg_new_tokenizer(const llama_vocab * vocab)
+     }
+     vocab_cache     = vocab;
+     tokenizer_cache = tokenizer;
++    native_tokens_cache = native_tokens;
+ 
+     return llg_clone_tokenizer(tokenizer_cache);
+ }
+ 
+ llama_sampler * llama_sampler_init_llg(const llama_vocab * vocab, const char * grammar_kind,
+                                        const char * grammar_data) {
++    std::set<std::string> native_tokens;
++    if (grammar_kind && std::string(grammar_kind) == "llguidance") {
++        auto data = common_json::parse(grammar_data);
++        if (data.contains("native_tokens")) {
++            for (const auto & marker : data.at("native_tokens").get<std::vector<std::string>>()) {
++                for (auto token : common_tokenize(vocab, marker, false, true)) {
++                    if (common_token_to_piece(vocab, token, false).empty() && !llama_vocab_is_eog(vocab, token)) {
++                        native_tokens.insert(common_token_to_piece(vocab, token, true));
++                    }
++                }
++            }
++        }
++    }
+     auto * ctx = new llama_sampler_llg;
+ 
+     if (grammar_kind != nullptr && grammar_kind[0] != '\0') {
+-        auto tokenizer = llama_sampler_llg_new_tokenizer(vocab);
++        auto tokenizer = llama_sampler_llg_new_tokenizer(vocab, native_tokens);
++        if (!tokenizer) {
++            delete ctx;
++            throw std::runtime_error("llguidance tokenizer initialization failed");
++        }
+         *ctx           = {
+             /* .vocab        = */ vocab,
+             /* .grammar_kind = */ grammar_kind,
+@@ -231,6 +262,11 @@ llama_sampler * llama_sampler_init_llg(const llama_vocab * vocab, const char * g
+             /* .tokenizer    = */ tokenizer,
+             /* .grammar      = */ llama_sampler_llg_new(tokenizer, grammar_kind, grammar_data),
+         };
++        if (!ctx->grammar) {
++            llg_free_tokenizer(tokenizer);
++            delete ctx;
++            throw std::runtime_error("llguidance grammar compilation failed (see server log)");
++        }
+         if (ctx->grammar) {
+             GGML_ASSERT(((size_t) llama_vocab_n_tokens(vocab) + 31) / 32 * 4 ==
+                         llg_matcher_get_mask_byte_size(ctx->grammar));
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 564fa9c..c71aad8 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -216,7 +216,10 @@ struct common_sampler * common_sampler_init(
+     const std::string & grammar_str = common_grammar_value(params.grammar);
+     if (grammar_str.compare(0, 11, "%llguidance") == 0) {
+ #ifdef LLAMA_USE_LLGUIDANCE
+-        grmr = llama_sampler_init_llg(vocab, "lark", grammar_str.c_str());
++        const std::string native_prefix = "%llguidance-json\n";
++        const bool native = grammar_str.compare(0, native_prefix.size(), native_prefix) == 0;
++        grmr = llama_sampler_init_llg(vocab, native ? "llguidance" : "lark",
++                                      grammar_str.c_str() + (native ? native_prefix.size() : 0));
+ #else
+         throw std::runtime_error("failed to parse grammar: llguidance is not enabled");
+ #endif // LLAMA_USE_LLGUIDANCE
+@@ -643,6 +646,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+     // apply reasoning budget first
+     llama_sampler_apply(rbudget, &cur_p);
+ 
++    if (common_grammar_value(gsmpl->params.grammar).find("%llguidance-json\n") == 0) { grammar_first = true; }
++
+     if (grammar_first && grammar_should_apply(gsmpl)) {
+         llama_sampler_apply(grmr, &cur_p);
+     }
+diff --git a/src/llama-grammar.h b/src/llama-grammar.h
+index 2885f77..a9e5ad2 100644
+--- a/src/llama-grammar.h
++++ b/src/llama-grammar.h
+@@ -83,7 +83,7 @@ std::vector<llama_grammar_candidate> llama_grammar_reject_candidates_for_stack(
+         const llama_grammar_stack      & stack,
+         const llama_grammar_candidates & candidates);
+ 
+-struct llama_grammar_parser {
++struct LLAMA_API llama_grammar_parser {
+     const llama_vocab * vocab;
+     std::map<std::string, uint32_t> symbol_ids;
+ 
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 4224a15..ec0b971 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -422,3 +422,9 @@ if (TARGET gguf-model-data)
+     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
+     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
+ endif()
++
++if (LLAMA_LLGUIDANCE)
++    llama_build_and_test(test-tool-input-grammar.cpp LABEL behavior WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
++    target_include_directories(test-tool-input-grammar PRIVATE ${CMAKE_BINARY_DIR}/llguidance/source/target/release)
++    target_link_libraries(test-tool-input-grammar PRIVATE llguidance)
++endif()
+diff --git a/tests/test-tool-input-grammar.cpp b/tests/test-tool-input-grammar.cpp
+new file mode 100644
+index 0000000..095267c
+--- /dev/null
++++ b/tests/test-tool-input-grammar.cpp
+@@ -0,0 +1,254 @@
++#ifdef NDEBUG
++#undef NDEBUG
++#endif
++#include "chat.h"
++#include "llguidance.h"
++
++#include <cassert>
++#include <algorithm>
++#include <fstream>
++#include <functional>
++#include <iostream>
++#include <memory>
++#include <sstream>
++
++using json = common_json;
++using matcher_ptr = std::unique_ptr<LlgMatcher, decltype(&llg_free_matcher)>;
++static LlgTokenizer * tokenizer;
++static const std::vector<std::string> pieces = {"<tool_call>", "</tool_call>", "\\n", "\\\"", "<function", "</param>", "</function>"};
++
++static matcher_ptr matcher(const std::string & grammar) {
++    LlgConstraintInit init;
++    llg_constraint_init_set_defaults(&init, tokenizer);
++    return matcher_ptr(llg_new_matcher(&init, "llguidance", grammar.c_str()), llg_free_matcher);
++}
++
++static bool accepts(const std::string & grammar, const std::string & text, bool compound = false, bool diagnostic = false) {
++    auto m = matcher(grammar);
++    if (const char * error = llg_matcher_get_error(m.get())) {
++        throw std::runtime_error(std::string(error) + "\n" + grammar);
++    }
++    for (size_t pos = 0; pos < text.size();) {
++        uint32_t token = static_cast<unsigned char>(text[pos]);
++        size_t length = 1;
++        if (compound) {
++            for (size_t i = 0; i < pieces.size(); ++i) {
++                if (text.compare(pos, pieces[i].size(), pieces[i]) == 0) {
++                    token = 257 + i;
++                    length = pieces[i].size();
++                    break;
++                }
++            }
++        }
++        assert(llg_matcher_compute_mask(m.get()) == 0);
++        const auto * mask = llg_matcher_get_mask(m.get());
++        if (!(mask[token / 32] & (1u << (token % 32)))) {
++            if (diagnostic) { std::cerr << "Rejected at byte " << pos << ": " << json(text.substr(pos, length)).dump() << "\n"; }
++            return false;
++        }
++        assert(llg_matcher_consume_token(m.get(), token) == 0);
++        pos += length;
++    }
++    return llg_matcher_is_accepting(m.get());
++}
++
++static std::string body_grammar(const std::string & definition, const std::string & mode) {
++    return json{{"grammars", json::array({
++        {{"name", "outer"}, {"lark_grammar", "start: \"BEGIN\" @body \"END\""}},
++        {{"name", "body"}, {"lark_grammar", definition}, {"tool_input_mode", mode}}
++    })}}.dump();
++}
++
++static json tool(const std::string & name, const std::string & grammar = "") {
++    json schema = {{"type", "object"}, {"properties", {{"input", {{"type", "string"}}}}},
++                   {"required", json::array({"input"})}, {"additionalProperties", false}};
++    if (grammar.empty()) {
++        schema["properties"] = {{"path", {{"type", "string"}}}};
++        schema["required"] = json::array({"path"});
++    }
++    json function = {{"name", name}, {"description", name}, {"parameters", schema}};
++    if (!grammar.empty()) {
++        function["input_grammar"] = {{"syntax", "lark"}, {"definition", grammar}};
++    }
++    return {{"type", "function"}, {"function", function}};
++}
++
++static common_chat_params apply(const std::string & file, const json & tools, bool required, bool parallel, bool none = false, const std::string & profile = "qwen-json") {
++    std::ifstream stream("models/templates/" + file);
++    assert(stream.good());
++    std::stringstream text;
++    text << stream.rdbuf();
++    auto tmpl = common_chat_templates_init(nullptr, text.str(), "", "");
++    common_chat_templates_inputs inputs;
++    common_chat_msg msg;
++    msg.role = "user";
++    msg.content = "Use the appropriate tool.";
++    inputs.messages = {msg};
++    inputs.tools = common_chat_tools_parse_oaicompat(tools);
++    inputs.enable_thinking = false;
++    inputs.tool_choice = none ? COMMON_CHAT_TOOL_CHOICE_NONE :
++        (required ? COMMON_CHAT_TOOL_CHOICE_REQUIRED : COMMON_CHAT_TOOL_CHOICE_AUTO);
++    inputs.parallel_tool_calls = parallel;
++    std::ifstream descriptor("tests/runtime-tool-formats/" + profile + ".json");
++    assert(descriptor.good());
++    descriptor >> inputs.native_tool_format;
++    return common_chat_templates_apply(tmpl.get(), inputs);
++}
++
++static std::string grammar(const common_chat_params & p) {
++    const std::string prefix = "%llguidance-json\n";
++    assert(p.grammar.find(prefix) == 0);
++    return p.grammar.substr(prefix.size());
++}
++
++static void check(const common_chat_params & p, const std::string & text, bool valid) {
++    const std::string prefill = p.grammar_lazy ? "" : p.generation_prompt;
++    const bool bytes = accepts(grammar(p), prefill + text);
++    const bool compound = accepts(grammar(p), prefill + text, true);
++    if (bytes != valid || compound != valid) {
++        std::cerr << "Expected=" << valid << " byte=" << bytes << " compound=" << compound << "\n";
++        accepts(grammar(p), prefill + text, false, true);
++        accepts(grammar(p), prefill + text, true, true);
++        throw std::runtime_error("unexpected acceptance: " + text + "\n" + grammar(p));
++    }
++}
++
++static common_chat_msg parse(const common_chat_params & p, const std::string & text, bool partial = false) {
++    common_chat_parser_params pp(p);
++    pp.parser = p.parser;
++    return common_chat_parse(common_chat_input(text), partial, pp);
++}
++
++static void expect_error(const std::function<void()> & action) {
++    bool failed = false;
++    try { action(); } catch (const std::exception &) { failed = true; }
++    assert(failed);
++}
++
++int main() {
++    // A byte vocabulary exercises token masks without any model or tokenizer download.
++    std::vector<uint32_t> lengths(257, 1);
++    std::vector<uint8_t> bytes;
++    for (int c = 0; c < 256; ++c) { bytes.push_back(c); }
++    lengths[256] = 4;
++    bytes.insert(bytes.end(), {255, 'E', 'O', 'S'});
++    for (const auto & piece : pieces) {
++        lengths.push_back(piece.size());
++        bytes.insert(bytes.end(), piece.begin(), piece.end());
++    }
++    LlgTokenizerInit ti = {};
++    ti.vocab_size = lengths.size();
++    ti.tok_eos = 256;
++    ti.token_lens = lengths.data();
++    ti.token_bytes = bytes.data();
++    ti.use_approximate_greedy_tokenize_fn = true;
++    char error[2048];
++    tokenizer = llg_new_tokenizer(&ti, error, sizeof(error));
++    if (!tokenizer) { throw std::runtime_error(error); }
++
++    const std::string recursive = "start: expr\nexpr: NUMBER | \"(\" expr \"+\" expr \")\"\nNUMBER: /[0-9]+/\n%ignore /[ ]+/";
++    const std::string patch = "start: \"*** Begin Patch\\n*** Delete File: \" PATH \"\\n*** End Patch\"\nPATH: /[^\\r\\n]+/";
++    auto body = body_grammar(recursive, "json_string");
++    assert(accepts(body, "BEGIN(1+(2+3))END"));
++    assert(accepts(body, "BEGIN( 1 + (2+3))END"));
++    assert(!accepts(body, "BEGIN(1+(2+3)END"));
++    assert(!accepts(body, "BEGIN(1*2)END"));
++    const std::string literal = std::string("line\n\"quote\"\\") + "\xe4\xb8\xad\xe6\x96\x87" + '\0';
++    auto quoted = json(literal).dump();
++    body = body_grammar("start: " + json(literal).dump(), "json_string");
++    assert(accepts(body, "BEGIN" + quoted.substr(1, quoted.size() - 2) + "END"));
++    assert(!accepts(body, "BEGIN" + literal + "END"));
++    assert(accepts(body_grammar("start: \"\"", "json_string"), "BEGINEND"));
++    auto controls = body_grammar("start: /[\\x00-\\x1f]+/", "json_string");
++    assert(accepts(controls, "BEGIN\\n\\tEND"));
++    assert(!accepts(controls, "BEGIN\\\"END"));
++    assert(!accepts(controls, "BEGIN\\\\END"));
++    auto character = body_grammar(R"(start: /[^\r\n"]/)", "json_string");
++    for (int c = 0; c < 128; ++c) {
++        auto encoded = json(std::string(1, static_cast<char>(c))).dump();
++        const auto sample = "BEGIN" + encoded.substr(1, encoded.size() - 2) + "END";
++        const bool expected = c != '\r' && c != '\n' && c != '"';
++        if (accepts(character, sample) != expected) {
++            std::cerr << "Character mismatch: " << c << " expected=" << expected << "\n";
++            accepts(character, sample, false, true);
++            throw std::runtime_error("JSON character class mismatch");
++        }
++    }
++    auto ignored = body_grammar("start: \"a\" \"\\\"\"\n%ignore /[\\n\\t ]+/", "json_string");
++    assert(accepts(ignored, "BEGIN\\na\\t\\\"\\nEND"));
++
++    auto raw_grammar = [](const std::string & definition, const std::string & stop) {
++        return json{{"grammars", json::array({
++            {{"name", "outer"}, {"lark_grammar", "start: @body " + json(stop).dump()}},
++            {{"name", "body"}, {"lark_grammar", definition}, {"tool_input_mode", "raw"}, {"tool_input_stop", stop}}
++        })}}.dump();
++    };
++    assert(accepts(raw_grammar(recursive, "</param>"), "(1+(2+3))</param>"));
++    assert(accepts(raw_grammar("start: \"<div>ok</div>\"", "</param>"), "<div>ok</div></param>"));
++    // Boundary collisions across productions, recursion, ignores and suffix overlap.
++    for (const auto & source : {"start: \"</param>\"", "start: a b\na: \"</pa\"\nb: \"ram>\"",
++            "start: x\nx: \"x\" x | \"</param>\"", "start: \"ok\"\n%ignore /<\\/param>/"}) {
++        auto m = matcher(raw_grammar(source, "</param>"));
++        assert(llg_matcher_get_error(m.get()));
++    }
++    { auto m = matcher(raw_grammar("start: \"ab\"", "aba")); assert(llg_matcher_get_error(m.get())); }
++    // Prefix A + a possible delimiter prefix must not bypass the body requirement AB.
++    auto boundary = matcher(raw_grammar("start: \"AB\"", "\n</parameter>\n"));
++    assert(!llg_matcher_get_error(boundary.get()));
++    assert(llg_matcher_consume_token(boundary.get(), 'A') == 0);
++    assert(llg_matcher_compute_mask(boundary.get()) == 0);
++    auto mask = llg_matcher_get_mask(boundary.get());
++    assert(!(mask['\n' / 32] & (1u << ('\n' % 32))));
++    assert(mask['B' / 32] & (1u << ('B' % 32)));
++
++    std::ifstream cases_stream("tests/runtime-tool-formats/tests.json");
++    assert(cases_stream.good());
++    json cases; cases_stream >> cases;
++    for (const auto & entry : cases) {
++        const std::string profile = entry.at("profile"), file = entry.at("template");
++        const auto & tools = entry.at("tools");
++        std::cerr << "Testing runtime format: " << profile << "\n";
++        auto p = apply(file, tools, false, true, false, profile);
++        check(p, "Hello", true);
++        for (const auto & sample : entry.at("accept")) {
++            const std::string text = sample.at("text");
++            check(p, text, true);
++            check(p, text + text, true);
++            auto msg = parse(p, text);
++            assert(msg.tool_calls.size() == 1);
++            assert(msg.tool_calls[0].name == sample.at("name"));
++            if (json::parse(msg.tool_calls[0].arguments) != sample.at("arguments")) {
++                throw std::runtime_error("mapping mismatch " + msg.tool_calls[0].arguments);
++            }
++            // Streaming deltas must concatenate to the exact final arguments.
++            std::string previous;
++            for (size_t i = 0; i < text.size(); ++i) {
++                // Do not split UTF-8 inside a code point: actual incomplete-token
++                // bytes are buffered by the server before response parsing.
++                if (i && (static_cast<unsigned char>(text[i]) & 0xc0) == 0x80) { continue; }
++                auto partial = parse(p, text.substr(0, i), true);
++                if (partial.tool_calls.empty()) { continue; }
++                const auto & current = partial.tool_calls[0].arguments;
++                assert(current.compare(0, previous.size(), previous) == 0);
++                assert(msg.tool_calls[0].arguments.compare(0, current.size(), current) == 0);
++                previous = current;
++            }
++            auto single = apply(file, tools, true, false, false, profile);
++            check(single, text, true);
++            check(single, "Hello", false);
++            check(single, text + text, false);
++            check(single, text.substr(0, text.size() - 1), false);
++            expect_error([&] { parse(single, text.substr(0, text.size() - 1)); });
++        }
++        for (const auto & rejected : entry.at("reject")) { check(p, rejected.get<std::string>(), false); }
++        auto disabled = apply(file, tools, false, true, true, profile);
++        check(disabled, "Hello", true);
++        assert(parse(disabled, "Hello").tool_calls.empty());
++    }
++    // No descriptor fallback for grammar tools: fail before unconstrained sampling.
++    auto bad = tool("calculate", recursive);
++    bad["function"]["parameters"]["required"] = json::array();
++    expect_error([&] { common_chat_tools_parse_oaicompat(json::array({bad})); });
++    llg_free_tokenizer(tokenizer);
++    std::cout << "Runtime format tests passed (no model loaded).\n";
++}
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index 311eb4f..55b1b3c 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -1357,7 +1357,21 @@ json oaicompat_chat_params_parse(
+     auto tools = json_value(body, "tools", json());
+     auto has_tools = tools.is_array() && !tools.empty();
+     auto stream = json_value(body, "stream", false);
+-    auto tool_choice = json_value(body, "tool_choice", std::string("auto"));
++    std::string tool_choice = "auto";
++    if (body.contains("tool_choice") && body.at("tool_choice").is_object()) {
++        const auto & selected = body.at("tool_choice");
++        if (selected.value("type", "") != "function") { throw std::invalid_argument("tool_choice: expected function"); }
++        const auto name = selected.at("function").at("name").get<std::string>();
++        json filtered = json::array();
++        if (tools.is_array()) {
++            for (const auto & tool : tools) {
++                if (tool.at("function").at("name") == name) { filtered.push_back(tool); }
++            }
++        }
++        if (filtered.size() != 1) { throw std::invalid_argument("tool_choice: name must match exactly one tool"); }
++        tools = std::move(filtered);
++        tool_choice = "required";
++    } else { tool_choice = json_value(body, "tool_choice", std::string("auto")); }
+ 
+     if (!opt.use_jinja) {
+         if (has_tools) {
+@@ -1443,6 +1457,7 @@ json oaicompat_chat_params_parse(
+     inputs.tool_choice            = common_chat_tool_choice_parse_oaicompat(tool_choice);
+     inputs.json_schema            = json_schema.is_null() ? "" : json_schema.dump();
+     inputs.grammar                = grammar;
++    if (body.contains("native_tool_format")) { inputs.native_tool_format = body.at("native_tool_format"); }
+     inputs.use_jinja              = opt.use_jinja;
+     inputs.parallel_tool_calls    = json_value(body, "parallel_tool_calls", caps.at("supports_parallel_tool_calls").get<bool>());
+     inputs.add_generation_prompt  = json_value(body, "add_generation_prompt", true);
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 48f1e93..6e97357 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -5702,6 +5702,12 @@ static json get_res_props(const server_context_meta & meta, const common_params
+         { "cors_proxy_enabled",          params.ui_mcp_proxy },
+     };
+ 
++#ifdef LLAMA_USE_LLGUIDANCE
++    props["native_tool_input_grammar"] = {{"version", 2}, {"syntax", "lark"},
++        {"format_parameter", "native_tool_format"}, {"format_version", 1},
++        {"runtime_formats", true}, {"encodings", json::array({"json_string", "raw"})}};
++#endif
++
+     if (!params.server_connect_code.empty()) {
+         props["connect_code"] = params.server_connect_code;
+     }

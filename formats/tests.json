@@ -1,0 +1,586 @@
+[
+  {
+    "profile": "qwen-json",
+    "template": "Qwen-Qwen2.5-7B-Instruct.jinja",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "calculate",
+          "description": "calculate",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: expr\nexpr: NUMBER | \"(\" expr \"+\" expr \")\"\nNUMBER: /[0-9]+/\n%ignore /[ ]+/"
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "read_file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_.-]+$",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    ],
+    "accept": [
+      {
+        "text": "<tool_call>\n{\"name\":\"calculate\",\"arguments\":{\"input\":\"(1+(2+3))\"}}\n</tool_call>",
+        "name": "calculate",
+        "arguments": {
+          "input": "(1+(2+3))"
+        }
+      },
+      {
+        "text": "<tool_call>\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"README.md\"}}\n</tool_call>",
+        "name": "read_file",
+        "arguments": {
+          "path": "README.md"
+        }
+      }
+    ],
+    "reject": [
+      "<tool_call>\n{\"name\":\"calculate\",\"arguments\":{\"input\":\"(1*2)\"}}\n</tool_call>",
+      "<tool_call>\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"bad path\"}}\n</tool_call>"
+    ]
+  },
+  {
+    "profile": "qwen-coder",
+    "template": "Qwen3-Coder.jinja",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "calculate",
+          "description": "calculate",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: expr\nexpr: NUMBER | \"(\" expr \"+\" expr \")\"\nNUMBER: /[0-9]+/\n%ignore /[ ]+/"
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "read_file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_.-]+$",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    ],
+    "accept": [
+      {
+        "text": "<tool_call>\n<function=calculate>\n<parameter=input>\n(1+(2+3))\n</parameter>\n</function>\n</tool_call>",
+        "name": "calculate",
+        "arguments": {
+          "input": "(1+(2+3))"
+        }
+      },
+      {
+        "text": "<tool_call>\n<function=read_file>\n<parameter=path>\nREADME.md\n</parameter>\n</function>\n</tool_call>",
+        "name": "read_file",
+        "arguments": {
+          "path": "README.md"
+        }
+      }
+    ],
+    "reject": [
+      "<tool_call>\n<function=calculate>\n<parameter=input>\n(1*2)\n</parameter>\n</function>\n</tool_call>",
+      "<tool_call>\n<function=read_file>\n<parameter=path>\nbad path\n</parameter>\n</function>\n</tool_call>"
+    ]
+  },
+  {
+    "profile": "minicpm5-cdata",
+    "template": "openbmb-MiniCPM5-1B.jinja",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "calculate",
+          "description": "calculate",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: expr\nexpr: NUMBER | \"(\" expr \"+\" expr \")\"\nNUMBER: /[0-9]+/\n%ignore /[ ]+/"
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "read_file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_.-]+$",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    ],
+    "accept": [
+      {
+        "text": "<function name=\"calculate\"><param name=\"input\"><![CDATA[(1+(2+3))]]></param></function>",
+        "name": "calculate",
+        "arguments": {
+          "input": "(1+(2+3))"
+        }
+      },
+      {
+        "text": "<function name=\"read_file\"><param name=\"path\"><![CDATA[README.md]]></param></function>",
+        "name": "read_file",
+        "arguments": {
+          "path": "README.md"
+        }
+      }
+    ],
+    "reject": [
+      "<function name=\"calculate\"><param name=\"input\"><![CDATA[(1*2)]]></param></function>",
+      "<function name=\"read_file\"><param name=\"path\"><![CDATA[bad path]]></param></function>"
+    ]
+  },
+  {
+    "profile": "gemma4-scalars",
+    "template": "google-gemma-4-31B-it.jinja",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "calculate",
+          "description": "calculate",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: expr\nexpr: NUMBER | \"(\" expr \"+\" expr \")\"\nNUMBER: /[0-9]+/\n%ignore /[ ]+/"
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "read_file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_.-]+$",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    ],
+    "accept": [
+      {
+        "text": "<|tool_call>call:calculate{input:<|\"|>(1+(2+3))<|\"|>}<tool_call|>",
+        "name": "calculate",
+        "arguments": {
+          "input": "(1+(2+3))"
+        }
+      },
+      {
+        "text": "<|tool_call>call:read_file{path:<|\"|>README.md<|\"|>}<tool_call|>",
+        "name": "read_file",
+        "arguments": {
+          "path": "README.md"
+        }
+      }
+    ],
+    "reject": [
+      "<|tool_call>call:calculate{input:<|\"|>(1*2)<|\"|>}<tool_call|>",
+      "<|tool_call>call:read_file{path:<|\"|>bad path<|\"|>}<tool_call|>"
+    ]
+  },
+  {
+    "profile": "example-new-format",
+    "template": "Qwen-Qwen2.5-7B-Instruct.jinja",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "calculate",
+          "description": "calculate",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: expr\nexpr: NUMBER | \"(\" expr \"+\" expr \")\"\nNUMBER: /[0-9]+/\n%ignore /[ ]+/"
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "read_file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_.-]+$",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    ],
+    "accept": [
+      {
+        "text": "[[call:calculate]]\n{\"input\":\"(1+(2+3))\"}\n[[end]]",
+        "name": "calculate",
+        "arguments": {
+          "input": "(1+(2+3))"
+        }
+      },
+      {
+        "text": "[[call:read_file]]\n{\"path\":\"README.md\"}\n[[end]]",
+        "name": "read_file",
+        "arguments": {
+          "path": "README.md"
+        }
+      }
+    ],
+    "reject": [
+      "[[call:calculate]]\n{\"input\":\"(1*2)\"}\n[[end]]",
+      "[[call:read_file]]\n{\"path\":\"bad path\"}\n[[end]]"
+    ]
+  },
+  {
+    "profile": "qwen-json",
+    "template": "Qwen-Qwen2.5-7B-Instruct.jinja",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "apply_patch",
+          "description": "apply_patch",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: \"*** Begin Patch\\n*** Delete File: \" PATH \"\\n*** End Patch\"\nPATH: /[^\\r\\n]+/"
+          }
+        }
+      }
+    ],
+    "accept": [
+      {
+        "text": "<tool_call>\n{\"name\":\"apply_patch\",\"arguments\":{\"input\":\"*** Begin Patch\\n*** Delete File: dir<part>.txt\\n*** End Patch\"}}\n</tool_call>",
+        "name": "apply_patch",
+        "arguments": {
+          "input": "*** Begin Patch\n*** Delete File: dir<part>.txt\n*** End Patch"
+        }
+      }
+    ],
+    "reject": []
+  },
+  {
+    "profile": "qwen-coder",
+    "template": "Qwen3-Coder.jinja",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "apply_patch",
+          "description": "apply_patch",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: \"*** Begin Patch\\n*** Delete File: \" PATH \"\\n*** End Patch\"\nPATH: /[^\\r\\n]+/"
+          }
+        }
+      }
+    ],
+    "accept": [
+      {
+        "text": "<tool_call>\n<function=apply_patch>\n<parameter=input>\n*** Begin Patch\n*** Delete File: dir<part>.txt\n*** End Patch\n</parameter>\n</function>\n</tool_call>",
+        "name": "apply_patch",
+        "arguments": {
+          "input": "*** Begin Patch\n*** Delete File: dir<part>.txt\n*** End Patch"
+        }
+      }
+    ],
+    "reject": []
+  },
+  {
+    "profile": "minicpm5-cdata",
+    "template": "openbmb-MiniCPM5-1B.jinja",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "apply_patch",
+          "description": "apply_patch",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: \"*** Begin Patch\\n*** Delete File: \" PATH \"\\n*** End Patch\"\nPATH: /[^\\r\\n]+/"
+          }
+        }
+      }
+    ],
+    "accept": [
+      {
+        "text": "<function name=\"apply_patch\"><param name=\"input\"><![CDATA[*** Begin Patch\n*** Delete File: dir<part>.txt\n*** End Patch]]></param></function>",
+        "name": "apply_patch",
+        "arguments": {
+          "input": "*** Begin Patch\n*** Delete File: dir<part>.txt\n*** End Patch"
+        }
+      }
+    ],
+    "reject": []
+  },
+  {
+    "profile": "example-new-format",
+    "template": "Qwen-Qwen2.5-7B-Instruct.jinja",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "apply_patch",
+          "description": "apply_patch",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: \"*** Begin Patch\\n*** Delete File: \" PATH \"\\n*** End Patch\"\nPATH: /[^\\r\\n]+/"
+          }
+        }
+      }
+    ],
+    "accept": [
+      {
+        "text": "[[call:apply_patch]]\n{\"input\":\"*** Begin Patch\\n*** Delete File: dir<part>.txt\\n*** End Patch\"}\n[[end]]",
+        "name": "apply_patch",
+        "arguments": {
+          "input": "*** Begin Patch\n*** Delete File: dir<part>.txt\n*** End Patch"
+        }
+      }
+    ],
+    "reject": []
+  },
+  {
+    "profile": "qwen-coder",
+    "template": "Qwen3-Coder.jinja",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "literal",
+          "description": "literal",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: \" <div>中文</div> \""
+          }
+        }
+      }
+    ],
+    "accept": [
+      {
+        "text": "<tool_call>\n<function=literal>\n<parameter=input>\n <div>中文</div> \n</parameter>\n</function>\n</tool_call>",
+        "name": "literal",
+        "arguments": {
+          "input": " <div>中文</div> "
+        }
+      }
+    ],
+    "reject": []
+  },
+  {
+    "profile": "minicpm5-cdata",
+    "template": "openbmb-MiniCPM5-1B.jinja",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "literal",
+          "description": "literal",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: \"a</param><div>b</div>\""
+          }
+        }
+      }
+    ],
+    "accept": [
+      {
+        "text": "<function name=\"literal\"><param name=\"input\"><![CDATA[a</param><div>b</div>]]></param></function>",
+        "name": "literal",
+        "arguments": {
+          "input": "a</param><div>b</div>"
+        }
+      }
+    ],
+    "reject": []
+  }
+]

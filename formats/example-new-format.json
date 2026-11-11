@@ -1,0 +1,160 @@
+{
+  "version": 1,
+  "thinking_start": "<think>",
+  "thinking_end": [
+    "</think>"
+  ],
+  "preserved_tokens": [
+    "[[call:",
+    "<think>",
+    "</think>"
+  ],
+  "root": [
+    {
+      "op": "if",
+      "condition": "thinking_prefilled",
+      "then": [
+        {
+          "op": "reasoning",
+          "item": {
+            "op": "until",
+            "stops": [
+              "</think>"
+            ]
+          }
+        },
+        "</think>",
+        {
+          "op": "space"
+        }
+      ],
+      "else": {
+        "op": "repeat",
+        "item": [
+          "<think>",
+          {
+            "op": "reasoning",
+            "item": {
+              "op": "until",
+              "stops": [
+                "</think>"
+              ]
+            }
+          },
+          "</think>",
+          {
+            "op": "space"
+          }
+        ],
+        "min": 0,
+        "max": 1
+      }
+    },
+    {
+      "op": "if",
+      "condition": "tools",
+      "then": {
+        "op": "if",
+        "condition": "required",
+        "then": [
+          {
+            "op": "ref",
+            "name": "call"
+          },
+          {
+            "op": "if",
+            "condition": "parallel",
+            "then": {
+              "op": "repeat",
+              "item": [
+                {
+                  "op": "space"
+                },
+                {
+                  "op": "ref",
+                  "name": "call"
+                }
+              ],
+              "min": 0,
+              "max": -1
+            },
+            "else": []
+          },
+          {
+            "op": "space"
+          }
+        ],
+        "else": [
+          {
+            "op": "content",
+            "item": {
+              "op": "until",
+              "stops": [
+                "[[call:",
+                "<think>"
+              ]
+            }
+          },
+          {
+            "op": "repeat",
+            "item": [
+              {
+                "op": "ref",
+                "name": "call"
+              },
+              {
+                "op": "if",
+                "condition": "parallel",
+                "then": {
+                  "op": "repeat",
+                  "item": [
+                    {
+                      "op": "space"
+                    },
+                    {
+                      "op": "ref",
+                      "name": "call"
+                    }
+                  ],
+                  "min": 0,
+                  "max": -1
+                },
+                "else": []
+              },
+              {
+                "op": "space"
+              }
+            ],
+            "min": 0,
+            "max": 1
+          }
+        ]
+      },
+      "else": {
+        "op": "content",
+        "item": {
+          "op": "until",
+          "stops": [
+            "<think>"
+          ]
+        }
+      }
+    }
+  ],
+  "definitions": {
+    "call": {
+      "op": "tools",
+      "item": [
+        "[[call:",
+        {
+          "op": "name"
+        },
+        "]]\n",
+        {
+          "op": "args"
+        },
+        "\n[[end]]"
+      ]
+    }
+  }
+}

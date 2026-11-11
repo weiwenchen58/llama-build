@@ -1,0 +1,429 @@
+diff --git a/parser/src/api.rs b/parser/src/api.rs
+index 1eb234a..a9540f7 100644
+--- a/parser/src/api.rs
++++ b/parser/src/api.rs
+@@ -72,6 +72,13 @@ pub struct GrammarWithLexer {
+     /// The Lark grammar that the grammar should generate.
+     /// When this is set, nodes and rx_nodes must be empty.
+     pub lark_grammar: Option<String>,
++    /// Native tool body encoding; None preserves ordinary Lark behavior.
++    #[serde(default)]
++    pub tool_input_mode: Option<String>,
++    /// Exact closing delimiter for an unescaped native string. Compilation
++    /// rejects a body language that could collide with it (including overlaps).
++    #[serde(default)]
++    pub tool_input_stop: Option<String>,
+     // #[serde(flatten)]
+     // pub options: LLGuidanceOptions,
+ }
+diff --git a/parser/src/earley/from_guidance.rs b/parser/src/earley/from_guidance.rs
+index 734ca86..3cfe7b9 100644
+--- a/parser/src/earley/from_guidance.rs
++++ b/parser/src/earley/from_guidance.rs
+@@ -22,15 +22,15 @@ impl CompileCtx {
+     fn run_one(&mut self, input: GrammarWithLexer) -> Result<(SymIdx, LexemeClass)> {
+         let builder = std::mem::take(&mut self.builder).unwrap();
+ 
+-        let res = if let Some(lark) = input.lark_grammar {
++        let mut res = if let Some(lark) = input.lark_grammar {
+             #[cfg(feature = "lark")]
+             {
+-                use crate::lark::lark_to_llguidance;
++                use crate::lark::lark_tool_input;
+                 ensure!(
+                     input.json_schema.is_none(),
+                     "cannot have both lark_grammar and json_schema"
+                 );
+-                lark_to_llguidance(builder, &lark)?
++                lark_tool_input(builder, &lark, input.tool_input_mode.clone())?
+             }
+             #[cfg(not(feature = "lark"))]
+             {
+@@ -38,11 +38,22 @@ impl CompileCtx {
+                 bail!("lark_grammar is not supported in this build")
+             }
+         } else if let Some(json_schema) = input.json_schema {
+-            JsonCompileOptions::default().json_to_llg_with_overrides(builder, json_schema)?
++            match input.tool_input_mode.as_deref() {
++                None => JsonCompileOptions::default().json_to_llg_with_overrides(builder, json_schema)?,
++                Some("raw") => crate::json::compiler::raw_string_to_llg(builder, json_schema)?,
++                _ => bail!("JSON schema only supports raw string mode or ordinary JSON"),
++            }
+         } else {
+             bail!("grammar must have either lark_grammar or json_schema");
+         };
+ 
++        if input.tool_input_mode.as_deref() == Some("raw") {
++            let stop = input.tool_input_stop.as_deref().ok_or_else(|| anyhow::anyhow!("raw tool input requires tool_input_stop"))?;
++            res.builder.grammar.check_tool_delimiter(res.start_node, &mut res.builder.regex.spec, stop)?;
++        } else {
++            ensure!(input.tool_input_stop.is_none(), "tool_input_stop requires raw mode");
++        }
++
+         res.builder.check_limits()?;
+ 
+         let grammar_id = res.builder.grammar.sym_props(res.start_node).grammar_id;
+diff --git a/parser/src/earley/grammar.rs b/parser/src/earley/grammar.rs
+index 9632d2e..6fe4e31 100644
+--- a/parser/src/earley/grammar.rs
++++ b/parser/src/earley/grammar.rs
+@@ -409,6 +409,95 @@ impl Display for ParamCond {
+ }
+ 
+ impl Grammar {
++    /// Decide whether L(body) followed by the closing delimiter can contain an
++    /// earlier delimiter. This is CFG x DFA reachability, not a per-terminal
++    /// substring check: recursive rules and delimiters split over terminals count.
++    pub(crate) fn check_tool_delimiter(&self, root: SymIdx, lexer: &mut LexerSpec, stop: &str) -> Result<()> {
++        let pattern = stop.as_bytes();
++        ensure!(!pattern.is_empty() && pattern.len() <= 63, "raw delimiter must contain 1..63 bytes");
++        let n = pattern.len() + 1;
++        let bad = n - 1;
++        let mut next = vec![vec![bad; 256]; n];
++        for state in 0..bad {
++            for byte in 0u16..256 {
++                let mut candidate = pattern[..state].to_vec();
++                candidate.push(byte as u8);
++                next[state][byte as usize] = (0..=bad).rev()
++                    .find(|&k| candidate.ends_with(&pattern[..k])).unwrap();
++            }
++        }
++        let mut reachable = HashSet::default();
++        let mut pending = vec![root.as_usize()];
++        while let Some(idx) = pending.pop() {
++            if !reachable.insert(idx) { continue; }
++            let symbol = &self.symbols[idx];
++            ensure!(symbol.gen_grammar.is_none() && !symbol.props.parametric,
++                    "raw body cannot contain nested/parametric grammars");
++            for rule in &symbol.rules {
++                for (child, _) in &rule.rhs { pending.push(child.as_usize()); }
++            }
++        }
++        ensure!(reachable.len() * n * n <= 4_000_000, "raw boundary proof exceeds compilation budget");
++        let mut relations: HashMap<usize, Vec<u64>> = reachable.iter().map(|&idx| (idx, vec![0; n])).collect();
++        let mut fuel = 20_000_000usize;
++        for &idx in &reachable {
++            let Some(lexeme) = self.symbols[idx].lexeme else { continue; };
++            let rx = lexer.lexemes[lexeme.as_usize()].compiled_rx;
++            let mut dfa = lexer.regex_builder.to_regex_limited(rx, 1_000_000)?;
++            for from in 0..n {
++                let mut queue = vec![(dfa.initial_state(), from)];
++                let mut seen = HashSet::default();
++                while let Some((state, boundary)) = queue.pop() {
++                    if !seen.insert((state, boundary)) { continue; }
++                    if dfa.is_accepting(state) { relations.get_mut(&idx).unwrap()[from] |= 1u64 << boundary; }
++                    for byte in 0u16..256 {
++                        ensure!(fuel > 0, "raw boundary proof exceeds compilation budget");
++                        fuel -= 1;
++                        let target = dfa.transition(state, byte as u8);
++                        if !target.is_dead() { queue.push((target, next[boundary][byte as usize])); }
++                    }
++                }
++            }
++        }
++        loop {
++            let mut changed = false;
++            for &idx in &reachable {
++                for rule in &self.symbols[idx].rules {
++                    for from in 0..n {
++                        let mut states = 1u64 << from;
++                        for (child, _) in &rule.rhs {
++                            let mut result = 0;
++                            while states != 0 {
++                                ensure!(fuel > 0, "raw boundary proof exceeds compilation budget");
++                                fuel -= 1;
++                                let state = states.trailing_zeros() as usize;
++                                states &= states - 1;
++                                result |= relations[&child.as_usize()][state];
++                            }
++                            states = result;
++                        }
++                        let row = &mut relations.get_mut(&idx).unwrap()[from];
++                        changed |= states & !*row != 0;
++                        *row |= states;
++                    }
++                }
++            }
++            if !changed { break; }
++        }
++        let ends = relations[&root.as_usize()][0];
++        ensure!(ends & (1u64 << bad) == 0, "raw tool body can contain its closing delimiter; select a lossless encoding");
++        for state in 0..bad {
++            if ends & (1u64 << state) == 0 { continue; }
++            let mut current = state;
++            for (i, &byte) in pattern.iter().enumerate() {
++                current = next[current][byte as usize];
++                ensure!(current != bad || i + 1 == pattern.len(),
++                        "raw tool body can overlap its closing delimiter; select a lossless encoding");
++            }
++        }
++        Ok(())
++    }
++
+     pub fn new(name: Option<String>) -> Self {
+         Grammar {
+             name,
+diff --git a/parser/src/json/compiler.rs b/parser/src/json/compiler.rs
+index f505e15..d899cd5 100644
+--- a/parser/src/json/compiler.rs
++++ b/parser/src/json/compiler.rs
+@@ -60,6 +60,30 @@ struct Compiler {
+     string_cache: Option<NodeRef>,
+ }
+ 
++/// Reuse JSON Schema string normalization, patterns, enums and length checks,
++/// but expose decoded UTF-8 for a native unescaped parameter value.
++pub(crate) fn raw_string_to_llg(builder: GrammarBuilder, schema: Value) -> Result<GrammarResult> {
++    let options = JsonCompileOptions::default();
++    let built = build_schema(schema, &options)?;
++    if !built.warnings.is_empty() { bail!("raw schema has unsupported constraints: {:?}", built.warnings); }
++    let mut compiler = Compiler::new(options, builder);
++    fn regex(compiler: &Compiler, schema: &Schema) -> Result<RegexAst> {
++        match schema {
++            Schema::String(opts) => match compiler.gen_json_string(opts.clone())? {
++                RegexAst::JsonQuote(inner, _) => Ok(*inner),
++                _ => bail!("expected a quoted string schema"),
++            },
++            Schema::AnyOf(options) => Ok(RegexAst::Or(options.iter().map(|s| regex(compiler, s)).collect::<Result<Vec<_>>>()?)),
++            _ => bail!("raw schema must resolve to strings; references and other value types require JSON encoding"),
++        }
++    }
++    let rx = regex(&compiler, &built.schema)?;
++    let id = compiler.builder.add_grammar(LLGuidanceOptions::default(), RegexAst::NoMatch)?;
++    let root = compiler.ast_lexeme(rx)?;
++    compiler.builder.set_start_node(root);
++    Ok(compiler.builder.finalize(id))
++}
++
+ macro_rules! cache {
+     ($field:expr, $gen:expr) => {{
+         if $field.is_none() {
+diff --git a/parser/src/lark/compiler.rs b/parser/src/lark/compiler.rs
+index 1d71d34..edbc4ac 100644
+--- a/parser/src/lark/compiler.rs
++++ b/parser/src/lark/compiler.rs
+@@ -5,7 +5,7 @@ use crate::{
+     HashMap,
+ };
+ use anyhow::{anyhow, bail, ensure, Result};
+-use derivre::RegexAst;
++use derivre::{JsonQuoteOptions, RegexAst};
+ 
+ use crate::{
+     api::{GenGrammarOptions, GenOptions, GrammarId, LLGuidanceOptions, NodeProps, RegexExt},
+@@ -63,9 +63,18 @@ struct Compiler {
+     regex_ids: HashMap<String, RegexId>,
+     in_progress: HashMap<String, bool>,
+     pending_grammars: Vec<(NodeRef, Location, PendingGrammar)>,
++    tool_input_mode: Option<String>,
++    body_nodes: HashMap<RegexId, NodeRef>,
++    body_skip: Option<NodeRef>,
+ }
+ 
+ fn compile_lark(builder: GrammarBuilder, parsed: ParsedLark) -> Result<GrammarResult> {
++    compile_lark_body(builder, parsed, None)
++}
++
++fn compile_lark_body(builder: GrammarBuilder, parsed: ParsedLark, tool_input_mode: Option<String>) -> Result<GrammarResult> {
++    ensure!(matches!(tool_input_mode.as_deref(), None | Some("json_string") | Some("raw")),
++            "unsupported tool_input_mode");
+     let c = Compiler {
+         builder,
+         parsed,
+@@ -74,6 +83,9 @@ fn compile_lark(builder: GrammarBuilder, parsed: ParsedLark) -> Result<GrammarRe
+         regex_ids: HashMap::default(),
+         in_progress: HashMap::default(),
+         pending_grammars: vec![],
++        tool_input_mode,
++        body_nodes: HashMap::default(),
++        body_skip: None,
+     };
+     c.execute()
+ }
+@@ -87,7 +99,81 @@ pub fn lark_to_llguidance(mut builder: GrammarBuilder, lark: &str) -> Result<Gra
+     compile_lark(builder, parsed)
+ }
+ 
++pub fn lark_tool_input(builder: GrammarBuilder, lark: &str, mode: Option<String>) -> Result<GrammarResult> {
++    if mode.is_none() {
++        return lark_to_llguidance(builder, lark);
++    }
++    compile_lark_body(builder, parse_lark(lark)?, mode)
++}
++
+ impl Compiler {
++    // A quoted terminal cannot remain one greedy lexeme: PATH followed by a
++    // newline shares a '\\' prefix with an escaped backslash inside PATH.
++    // Lower the terminal's DFA to grammar rules and quote individual byte
++    // transitions. Complete JSON escape sequences are then atomic lexemes.
++    fn body_node(&mut self, rx: RegexId) -> Result<NodeRef> {
++        if let Some(node) = self.body_nodes.get(&rx) {
++            return Ok(*node);
++        }
++        let mut dfa = self.builder.regex.spec.regex_builder.to_regex_limited(rx, 1_000_000)?;
++        let initial = dfa.initial_state();
++        let root = self.builder.new_node("quoted_terminal");
++        let mut nodes = HashMap::default();
++        nodes.insert(initial, root);
++        let mut pending = vec![initial];
++        while let Some(state) = pending.pop() {
++            self.builder.check_limits()?;
++            let mut transitions: HashMap<NodeRef, Vec<u32>> = HashMap::default();
++            for byte in 0u16..=255 {
++                let next = dfa.transition(state, byte as u8);
++                ensure!(dfa.cost() <= 1_000_000, "tool input terminal DFA exceeds compilation budget");
++                if next.is_dead() {
++                    continue;
++                }
++                let target = *nodes.entry(next).or_insert_with(|| {
++                    pending.push(next);
++                    self.builder.new_node("quoted_state")
++                });
++                let set = transitions.entry(target).or_insert_with(|| vec![0; 8]);
++                set[byte as usize / 32] |= 1u32 << (byte % 32);
++            }
++            let mut options = vec![];
++            if dfa.is_accepting(state) {
++                options.push(self.builder.empty());
++            }
++            for (target, mut bytes) in transitions {
++                let mut encoded = vec![];
++                // Quote special bytes individually. This also avoids the upstream
++                // JsonQuote control-class shortcut admitting quotes not in a class.
++                let quote = self.tool_input_mode.as_deref() == Some("json_string");
++                for byte in (0u8..32).chain([b'"', b'\\', 127]).filter(|_| quote) {
++                    let mask = 1u32 << (byte % 32);
++                    if bytes[byte as usize / 32] & mask != 0 {
++                        bytes[byte as usize / 32] &= !mask;
++                        encoded.push(self.builder.regex.add_ast(RegexAst::JsonQuote(
++                            Box::new(RegexAst::Byte(byte)), JsonQuoteOptions::with_unicode_raw()))?);
++                        if byte == 127 {
++                            // DEL is legal unescaped JSON text too.
++                            encoded.push(self.builder.regex.add_ast(RegexAst::Byte(byte))?);
++                        }
++                    }
++                }
++                encoded.push(self.builder.regex.add_ast(RegexAst::ByteSet(bytes))?);
++                let encoded = self.builder.regex.select(encoded);
++                let byte = self.builder.lexeme(encoded);
++                options.push(self.builder.join(&[byte, target]));
++            }
++            let choices = self.builder.select(&options);
++            self.builder.set_placeholder(nodes[&state], choices);
++        }
++        self.body_nodes.insert(rx, root);
++        Ok(root)
++    }
++
++    fn body_regex(&mut self, rx: RegexId) -> Result<RegexId> {
++        Ok(rx)
++    }
++
+     fn do_token(&mut self, name: &str) -> Result<RegexId> {
+         if let Some(id) = self.regex_ids.get(name) {
+             return Ok(*id);
+@@ -123,6 +209,7 @@ impl Compiler {
+                 Ok(self.builder.regex.optional(id))
+             }
+             Atom::Not(inner) => {
++                ensure!(self.tool_input_mode.is_none(), "tool input does not support expression complement");
+                 let id = self.do_token_atom(*inner)?;
+                 Ok(self.builder.regex.not(id))
+             }
+@@ -171,7 +258,10 @@ impl Compiler {
+                     };
+                     self.mk_regex("regex", rx)
+                 }
+-                Value::RegexExt(s) => compile_lark_regex(&mut self.builder, s),
++                Value::RegexExt(s) => {
++                    ensure!(self.tool_input_mode.is_none(), "tool input does not support extended regex objects");
++                    compile_lark_regex(&mut self.builder, s)
++                }
+                 Value::SpecialToken(s) => {
+                     bail!("special tokens (like {:?}) cannot be used in terminals", s);
+                 }
+@@ -259,6 +349,14 @@ impl Compiler {
+     }
+ 
+     fn lift_regex(&mut self, rx_id: RegexId) -> Result<NodeRef> {
++        if self.tool_input_mode.is_some() {
++            let node = self.body_node(rx_id)?;
++            return Ok(match self.body_skip {
++                Some(skip) => self.builder.join(&[skip, node]),
++                None => node,
++            });
++        }
++        let rx_id = self.body_regex(rx_id)?;
+         Ok(self.builder.lexeme(rx_id))
+     }
+ 
+@@ -299,6 +397,11 @@ impl Compiler {
+                 Ok(self.lift_regex(rx)?)
+             }
+             Atom::Value(value) => {
++                if self.tool_input_mode.is_some() {
++                    ensure!(!matches!(&value, Value::SpecialToken(_) | Value::GrammarRef(_) |
++                        Value::NestedLark(_) | Value::Json(_) | Value::RegexExt(_)),
++                        "tool input supports text Lark only, without nested grammars or special tokens");
++                }
+                 match &value {
+                     Value::Name(n) => {
+                         if self.is_rule(n) {
+@@ -483,6 +586,10 @@ impl Compiler {
+             .remove(name)
+             .ok_or_else(|| anyhow!("rule {:?} not found", name))?;
+ 
++        if self.tool_input_mode.is_some() {
++            ensure!(rule.stop_like().is_none() && rule.temperature.is_none() && rule.max_tokens.is_none() &&
++                    !rule.is_parametric, "tool input does not support generation attributes or parametric rules");
++        }
+         self.in_progress
+             .insert(name.to_string(), rule.is_parametric);
+ 
+@@ -622,13 +729,33 @@ impl Compiler {
+             serde_json::from_value(self.grammar.llguidance_options.clone())
+                 .map_err(|e| anyhow!("failed to parse %llguidance declaration: {}", e))?;
+ 
++        ensure!(self.tool_input_mode.is_none() || !opts.allow_invalid_utf8,
++                "tool input requires valid UTF-8");
+         let ignore = ignore
+             .into_iter()
+-            .map(|exp| Ok(RegexAst::ExprRef(self.do_token_expansions(exp)?)))
++            .map(|exp| {
++                let rx = self.do_token_expansions(exp)?;
++                Ok(rx)
++            })
+             .collect::<Result<Vec<_>>>()?;
+-        let id = self.builder.add_grammar(opts, RegexAst::Or(ignore))?;
+-
++        let json_body = self.tool_input_mode.is_some();
++        let mut lexer_ignore = vec![];
++        if !json_body {
++            for rx in &ignore {
++                lexer_ignore.push(RegexAst::ExprRef(self.body_regex(*rx)?));
++            }
++        }
++        let id = self.builder.add_grammar(opts, RegexAst::Or(lexer_ignore))?;
++        if json_body && !ignore.is_empty() {
++            let rx = self.builder.regex.select(ignore);
++            let node = self.body_node(rx)?;
++            self.body_skip = Some(self.builder.repeat(node, 0, None));
++        }
+         let start = self.do_rule(start_name, None)?;
++        let start = match self.body_skip {
++            Some(skip) => self.builder.join(&[skip, start, skip]),
++            None => start,
++        };
+         self.builder.set_start_node(start);
+ 
+         let mut builder = self.builder;
+diff --git a/parser/src/lark/mod.rs b/parser/src/lark/mod.rs
+index 8a41495..04cf909 100644
+--- a/parser/src/lark/mod.rs
++++ b/parser/src/lark/mod.rs
+@@ -4,4 +4,4 @@ mod compiler;
+ mod lexer;
+ mod parser;
+ 
+-pub use compiler::lark_to_llguidance;
++pub use compiler::{lark_to_llguidance, lark_tool_input};
