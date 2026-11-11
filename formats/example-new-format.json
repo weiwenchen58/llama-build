@@ -147,9 +147,9 @@
       "item": [
         "[[call:",
         {
-          "op": "name"
+          "op": "name",
+          "suffix": "]]\n"
         },
-        "]]\n",
         {
           "op": "args"
         },

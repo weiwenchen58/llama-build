@@ -147,9 +147,9 @@
       "item": [
         "<tool_call>\n<function=",
         {
-          "op": "name"
+          "op": "name",
+          "suffix": ">\n"
         },
-        ">\n",
         {
           "op": "if",
           "condition": "input_grammar",
@@ -174,9 +174,9 @@
             "item": [
               "<parameter=",
               {
-                "op": "parameter_name"
+                "op": "parameter_name",
+                "suffix": ">\n"
               },
-              ">\n",
               {
                 "op": "if",
                 "condition": "string",

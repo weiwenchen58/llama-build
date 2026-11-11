@@ -29,6 +29,29 @@
       {
         "type": "function",
         "function": {
+          "name": "calculate_more",
+          "description": "calculate",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: expr\nexpr: NUMBER | \"(\" expr \"+\" expr \")\"\nNUMBER: /[0-9]+/\n%ignore /[ ]+/"
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
           "name": "read_file",
           "description": "read_file",
           "parameters": {
@@ -62,6 +85,13 @@
         "arguments": {
           "path": "README.md"
         }
+      },
+      {
+        "text": "<tool_call>\n{\"name\":\"calculate_more\",\"arguments\":{\"input\":\"(1+(2+3))\"}}\n</tool_call>",
+        "name": "calculate_more",
+        "arguments": {
+          "input": "(1+(2+3))"
+        }
       }
     ],
     "reject": [
@@ -77,6 +107,29 @@
         "type": "function",
         "function": {
           "name": "calculate",
+          "description": "calculate",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: expr\nexpr: NUMBER | \"(\" expr \"+\" expr \")\"\nNUMBER: /[0-9]+/\n%ignore /[ ]+/"
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "calculate_more",
           "description": "calculate",
           "parameters": {
             "type": "object",
@@ -132,6 +185,13 @@
         "arguments": {
           "path": "README.md"
         }
+      },
+      {
+        "text": "<tool_call>\n<function=calculate_more>\n<parameter=input>\n(1+(2+3))\n</parameter>\n</function>\n</tool_call>",
+        "name": "calculate_more",
+        "arguments": {
+          "input": "(1+(2+3))"
+        }
       }
     ],
     "reject": [
@@ -147,6 +207,29 @@
         "type": "function",
         "function": {
           "name": "calculate",
+          "description": "calculate",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: expr\nexpr: NUMBER | \"(\" expr \"+\" expr \")\"\nNUMBER: /[0-9]+/\n%ignore /[ ]+/"
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "calculate_more",
           "description": "calculate",
           "parameters": {
             "type": "object",
@@ -202,6 +285,13 @@
         "arguments": {
           "path": "README.md"
         }
+      },
+      {
+        "text": "<function name=\"calculate_more\"><param name=\"input\"><![CDATA[(1+(2+3))]]></param></function>",
+        "name": "calculate_more",
+        "arguments": {
+          "input": "(1+(2+3))"
+        }
       }
     ],
     "reject": [
@@ -217,6 +307,29 @@
         "type": "function",
         "function": {
           "name": "calculate",
+          "description": "calculate",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: expr\nexpr: NUMBER | \"(\" expr \"+\" expr \")\"\nNUMBER: /[0-9]+/\n%ignore /[ ]+/"
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "calculate_more",
           "description": "calculate",
           "parameters": {
             "type": "object",
@@ -272,6 +385,13 @@
         "arguments": {
           "path": "README.md"
         }
+      },
+      {
+        "text": "<|tool_call>call:calculate_more{input:<|\"|>(1+(2+3))<|\"|>}<tool_call|>",
+        "name": "calculate_more",
+        "arguments": {
+          "input": "(1+(2+3))"
+        }
       }
     ],
     "reject": [
@@ -287,6 +407,29 @@
         "type": "function",
         "function": {
           "name": "calculate",
+          "description": "calculate",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "additionalProperties": false
+          },
+          "input_grammar": {
+            "syntax": "lark",
+            "definition": "start: expr\nexpr: NUMBER | \"(\" expr \"+\" expr \")\"\nNUMBER: /[0-9]+/\n%ignore /[ ]+/"
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "calculate_more",
           "description": "calculate",
           "parameters": {
             "type": "object",
@@ -341,6 +484,13 @@
         "name": "read_file",
         "arguments": {
           "path": "README.md"
+        }
+      },
+      {
+        "text": "[[call:calculate_more]]\n{\"input\":\"(1+(2+3))\"}\n[[end]]",
+        "name": "calculate_more",
+        "arguments": {
+          "input": "(1+(2+3))"
         }
       }
     ],

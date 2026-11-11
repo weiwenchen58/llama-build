@@ -61,11 +61,11 @@ recursive body languages belong in Lark.
 | `until` | `stops`: consume until a delimiter, leave it for the next literal |
 | `content`, `reasoning` | `item`: capture assistant text or reasoning |
 | `tools` | `item`: expand one alternative per allowed tool |
-| `name` | Match and capture the current tool name |
+| `name` | `suffix`: capture the tool name only after its wire boundary is complete |
 | `args` | JSON arguments, bound to JSON Schema or encoded Lark input |
 | `input` | `stop`: raw decoded Lark input ending before this exact delimiter |
 | `parameters` | `item`, optional wire `separator`: expand closed-object fields |
-| `parameter_name` | Match a property name and emit its JSON key |
+| `parameter_name` | `suffix`: capture a complete property name and emit its JSON key |
 | `parameter_value` | `encoding`: `json` or `raw`; raw needs `stop`; optional `scalar_only` |
 | `emit` | `value`: emit a fixed JSON fragment without consuming wire bytes |
 

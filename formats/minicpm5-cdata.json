@@ -147,9 +147,9 @@
       "item": [
         "<function name=\"",
         {
-          "op": "name"
+          "op": "name",
+          "suffix": "\">"
         },
-        "\">",
         {
           "op": "if",
           "condition": "input_grammar",
@@ -175,9 +175,9 @@
             "item": [
               "<param name=\"",
               {
-                "op": "parameter_name"
+                "op": "parameter_name",
+                "suffix": "\">"
               },
-              "\">",
               {
                 "op": "if",
                 "condition": "string",

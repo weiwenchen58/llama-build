@@ -59,10 +59,10 @@ index 114fa04..649c45d 100644
  
 diff --git a/common/chat-tool-grammar.cpp b/common/chat-tool-grammar.cpp
 new file mode 100644
-index 0000000..107cf66
+index 0000000..5ac3f80
 --- /dev/null
 +++ b/common/chat-tool-grammar.cpp
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,321 @@
 +#include "chat-peg-parser.h"
 +#include "chat-auto-parser.h"
 +#include "parsers/parsers.h"
@@ -222,8 +222,11 @@ index 0000000..107cf66
 +        }
 +        if (op == "name") {
 +            require(tool, "name outside tools");
-+            // Names are literal bytes. Quote/bracket characters belong in data.
-+            return p.atomic(p.tag("runtime-name", p.literal(tool->name)));
++            const auto suffix = node.at("suffix").get<std::string>();
++            require(!suffix.empty(), "name requires an atomic closing suffix");
++            // Delay names until their boundary is known: foo and foobar must
++            // never emit incompatible streaming name deltas for prefix foo.
++            return p.atomic(p.tag("runtime-name", p.literal(tool->name)) + p.literal(suffix));
 +        }
 +        if (op == "args") {
 +            require(tool, "args outside tools");
@@ -276,7 +279,9 @@ index 0000000..107cf66
 +        }
 +        if (op == "parameter_name") {
 +            require(!property.is_null(), "parameter_name outside parameters");
-+            return p.atomic(p.tag("runtime-key", p.literal(property_name)));
++            const auto suffix = node.at("suffix").get<std::string>();
++            require(!suffix.empty(), "parameter_name requires an atomic closing suffix");
++            return p.atomic(p.tag("runtime-key", p.literal(property_name)) + p.literal(suffix));
 +        }
 +        if (op == "parameter_value") {
 +            require(!property.is_null(), "parameter_value outside parameters");
@@ -380,7 +385,7 @@ index 0000000..107cf66
 +    return result;
 +}
 diff --git a/common/chat.cpp b/common/chat.cpp
-index 5f956e6..c9c45a0 100644
+index 5f956e6..dfebcda 100644
 --- a/common/chat.cpp
 +++ b/common/chat.cpp
 @@ -627,6 +627,9 @@ json common_chat_tools_to_json_oaicompat(const std::vector<common_chat_tool> & t
@@ -470,7 +475,7 @@ index 5f956e6..c9c45a0 100644
      //LOG_DBG("Parsing PEG input with format %s: %s\n", common_chat_format_name(params.format), effective_input.text.c_str());
  
 -    common_peg_parse_flags flags = COMMON_PEG_PARSE_FLAG_LENIENT;
-+    common_peg_parse_flags flags = params.format == COMMON_CHAT_FORMAT_PEG_RUNTIME ?
++    common_peg_parse_flags flags = params.format == COMMON_CHAT_FORMAT_PEG_RUNTIME && !is_partial ?
 +        COMMON_PEG_PARSE_FLAG_NONE : COMMON_PEG_PARSE_FLAG_LENIENT;
      if (!is_partial) {
          flags |= COMMON_PEG_PARSE_FLAG_COMPLETE;
@@ -643,7 +648,7 @@ index 500bb09..f927e8c 100644
              GGML_ASSERT(((size_t) llama_vocab_n_tokens(vocab) + 31) / 32 * 4 ==
                          llg_matcher_get_mask_byte_size(ctx->grammar));
 diff --git a/common/sampling.cpp b/common/sampling.cpp
-index 564fa9c..c71aad8 100644
+index 564fa9c..6b7ca67 100644
 --- a/common/sampling.cpp
 +++ b/common/sampling.cpp
 @@ -216,7 +216,10 @@ struct common_sampler * common_sampler_init(
@@ -667,6 +672,14 @@ index 564fa9c..c71aad8 100644
      if (grammar_first && grammar_should_apply(gsmpl)) {
          llama_sampler_apply(grmr, &cur_p);
      }
+@@ -734,6 +739,7 @@ static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
+ // Preserves the target distribution exactly, and accepts more often than matching does when the
+ // draft samples instead of taking its argmax.
+ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first) {
++    if (common_grammar_value(gsmpl->params.grammar).find("%llguidance-json\n") == 0) { grammar_first = true; }
+     GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+     GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
+ 
 diff --git a/src/llama-grammar.h b/src/llama-grammar.h
 index 2885f77..a9e5ad2 100644
 --- a/src/llama-grammar.h
@@ -696,10 +709,10 @@ index 4224a15..ec0b971 100644
 +endif()
 diff --git a/tests/test-tool-input-grammar.cpp b/tests/test-tool-input-grammar.cpp
 new file mode 100644
-index 0000000..095267c
+index 0000000..be48fdb
 --- /dev/null
 +++ b/tests/test-tool-input-grammar.cpp
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,255 @@
 +#ifdef NDEBUG
 +#undef NDEBUG
 +#endif
@@ -930,6 +943,7 @@ index 0000000..095267c
 +                if (i && (static_cast<unsigned char>(text[i]) & 0xc0) == 0x80) { continue; }
 +                auto partial = parse(p, text.substr(0, i), true);
 +                if (partial.tool_calls.empty()) { continue; }
++                assert(partial.tool_calls[0].name == msg.tool_calls[0].name);
 +                const auto & current = partial.tool_calls[0].arguments;
 +                assert(current.compare(0, previous.size(), previous) == 0);
 +                assert(msg.tool_calls[0].arguments.compare(0, current.size(), current) == 0);

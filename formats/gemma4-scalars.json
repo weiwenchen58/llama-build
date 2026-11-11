@@ -147,9 +147,9 @@
       "item": [
         "<|tool_call>call:",
         {
-          "op": "name"
+          "op": "name",
+          "suffix": "{"
         },
-        "{",
         {
           "op": "if",
           "condition": "input_grammar",
@@ -174,9 +174,9 @@
             "op": "parameters",
             "item": [
               {
-                "op": "parameter_name"
+                "op": "parameter_name",
+                "suffix": ":"
               },
-              ":",
               {
                 "op": "if",
                 "condition": "string",
