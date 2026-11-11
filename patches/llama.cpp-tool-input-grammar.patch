@@ -123,10 +123,10 @@ index 114fa04..2cc3bbc 100644
  
 diff --git a/common/chat-tool-grammar.cpp b/common/chat-tool-grammar.cpp
 new file mode 100644
-index 0000000..710eefe
+index 0000000..a51dcb5
 --- /dev/null
 +++ b/common/chat-tool-grammar.cpp
-@@ -0,0 +1,875 @@
+@@ -0,0 +1,874 @@
 +#include "chat-peg-parser.h"
 +#include "chat-auto-parser.h"
 +#include "parsers/parsers.h"
@@ -1001,7 +1001,6 @@ index 0000000..710eefe
 +    data.grammar_requires_tool = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
 +    data.grammar_allows_parallel = inputs.parallel_tool_calls;
 +}
-+
 diff --git a/common/chat.cpp b/common/chat.cpp
 index 5f956e6..78131ce 100644
 --- a/common/chat.cpp
