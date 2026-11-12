@@ -1,5 +1,5 @@
 diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
-index 8e3c88d..e173276 100644
+index 8e3c88d..d027f7b 100644
 --- a/common/CMakeLists.txt
 +++ b/common/CMakeLists.txt
 @@ -65,6 +65,7 @@ add_library(${TARGET}
@@ -23,7 +23,7 @@ index 8e3c88d..e173276 100644
      set(LLGUIDANCE_PATH ${LLGUIDANCE_SRC}/target/release)
      set(LLGUIDANCE_LIB_NAME "${CMAKE_STATIC_LIBRARY_PREFIX}llguidance${CMAKE_STATIC_LIBRARY_SUFFIX}")
  
-@@ -167,14 +174,15 @@ if (LLAMA_LLGUIDANCE)
+@@ -167,21 +174,22 @@ if (LLAMA_LLGUIDANCE)
          SOURCE_DIR ${LLGUIDANCE_SRC}
          BUILD_IN_SOURCE TRUE
          CONFIGURE_COMMAND ""
@@ -40,6 +40,14 @@ index 8e3c88d..e173276 100644
 +    add_library(llguidance STATIC IMPORTED GLOBAL)
      set_target_properties(llguidance PROPERTIES IMPORTED_LOCATION ${LLGUIDANCE_PATH}/${LLGUIDANCE_LIB_NAME})
      add_dependencies(llguidance llguidance_ext)
+ 
+     target_include_directories(${TARGET} PRIVATE ${LLGUIDANCE_PATH})
+     target_link_libraries(${TARGET} PRIVATE llguidance)
+     if (WIN32)
+-        target_link_libraries(${TARGET} PRIVATE ws2_32 userenv ntdll bcrypt)
++        target_link_libraries(llguidance INTERFACE ws2_32 userenv ntdll bcrypt)
+     endif()
+ endif()
  
 diff --git a/common/chat-auto-parser-generator.cpp b/common/chat-auto-parser-generator.cpp
 index 9b918b3..9d6b315 100644
@@ -1660,6 +1668,31 @@ index 2885f77..fb7a38d 100644
                struct llama_grammar & grammar,
                   const std::string & piece);
  
+diff --git a/src/unicode.h b/src/unicode.h
+index 29dbfc7..339a6ac 100644
+--- a/src/unicode.h
++++ b/src/unicode.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include "llama.h"
++
+ #include <cstdint>
+ #include <string>
+ #include <vector>
+@@ -91,10 +93,10 @@ struct unicode_cpt_flags {
+ 
+ size_t unicode_len_utf8(char src);
+ 
+-std::string unicode_cpt_to_utf8  (uint32_t cpt);
++LLAMA_API std::string unicode_cpt_to_utf8(uint32_t cpt);
+ uint32_t    unicode_cpt_from_utf8(const std::string & utf8, size_t & offset);
+ 
+-std::vector<uint32_t> unicode_cpts_from_utf8(const std::string & utf8);
++LLAMA_API std::vector<uint32_t> unicode_cpts_from_utf8(const std::string & utf8);
+ 
+ std::vector<uint32_t> unicode_cpts_normalize_nfd(const std::vector<uint32_t> & cpts);
+ std::vector<uint32_t> unicode_cpts_normalize_nfc(const std::vector<uint32_t> & cpts);
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
 index 4224a15..ec0b971 100644
 --- a/tests/CMakeLists.txt

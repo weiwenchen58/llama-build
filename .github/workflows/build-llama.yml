@@ -219,6 +219,9 @@ jobs:
             $configure += "-DLLGUIDANCE_PATCH=$patchPath"
           }
           $configure | Set-Content logs/cmake-arguments.txt
+          $sharedCheck = $configure -replace '^-DGGML_CUDA=ON$', '-DGGML_CUDA=OFF'
+          Invoke-Logged -Log configure-shared-check.log -Command cmake -Arguments $sharedCheck
+          Invoke-Logged -Log build-shared-check.log -Command cmake -Arguments @('--build', 'build', '--config', 'Release', '--target', 'llama-common', '--parallel', '2')
           Invoke-Logged -Log configure.log -Command cmake -Arguments $configure
           Invoke-Logged -Log build.log -Command cmake -Arguments @('--build', 'build', '--config', 'Release', '--target', 'llama-server', '--parallel', '2')
 

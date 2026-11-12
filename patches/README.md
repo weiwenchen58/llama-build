@@ -13,6 +13,9 @@ Pinned sources:
 Apply both patches. CMake applies the Rust patch to the actual Cargo source.
 CPU tests run before the Windows CUDA package build. Compilation, no-model
 validation, real-model inference and AIOS integration are separate results.
+Windows first links the shared CPU `llama-common` target before compiling CUDA,
+so missing DLL exports fail early. Referenced grammar/Unicode helpers are exported;
+the LLGuidance target carries its Windows system-library dependencies.
 
 ## Request
 
